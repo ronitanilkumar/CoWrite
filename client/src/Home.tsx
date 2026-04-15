@@ -1,9 +1,15 @@
-import { useState, useEffect, useRef, useCallback, type CSSProperties } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { storedUser, updateUserName } from './user'
-import { getUserDocuments, createDocument, deleteDocument, registerUser, getSharedDocuments } from './api'
-import { FilePlus, ArrowRight, Plus, FileText, Search, Trash2 } from 'lucide-react'
+import { useAuth } from './AuthContext'
+import { logout, getUserDocuments, createDocument, deleteDocument, getSharedDocuments, renameDocument, connectEvents, type ServerEvent } from './api'
+import { FilePlus, ArrowRight, ArrowUp, Check, ChevronDown, Gauge, Plus, FileText, Search, Sparkles, Trash2, Pencil, Code2, Table2, ListChecks, LogOut, type LucideIcon } from 'lucide-react'
 import './Home.css'
+
+interface Collaborator {
+  id: string
+  name: string
+  color: string
+}
 
 interface Doc {
   room: string
@@ -14,12 +20,44 @@ interface Doc {
     type: string
     text: string
   }>
+  collaborators?: Collaborator[]
 }
 
 interface SharedDoc extends Doc {
   owner_name: string
   owner_color: string
 }
+
+type AgentTaskMode = 'auto' | 'review' | 'expand' | 'proofread' | 'summarize'
+type AgentEffortMode = 'auto' | 'low' | 'balanced' | 'high' | 'extra-high'
+
+interface ComposerDoc extends Doc {
+  source: 'Owned' | 'Shared'
+  owner_name?: string
+}
+
+interface DropdownOption<T extends string> {
+  value: T
+  label: string
+  description: string
+  icon: LucideIcon
+}
+
+const AGENT_TASK_OPTIONS: Array<DropdownOption<AgentTaskMode>> = [
+  { value: 'auto', label: 'Auto', description: 'Infer the job from the instruction.', icon: Sparkles },
+  { value: 'review', label: 'Review', description: 'Find clarity, logic, and structure issues.', icon: Sparkles },
+  { value: 'expand', label: 'Expand', description: 'Add depth, examples, or explanation.', icon: Sparkles },
+  { value: 'proofread', label: 'Proofread', description: 'Catch grammar and punctuation issues.', icon: Sparkles },
+  { value: 'summarize', label: 'Summarize', description: 'Create a concise standalone summary.', icon: Sparkles },
+]
+
+const AGENT_EFFORT_OPTIONS: Array<DropdownOption<AgentEffortMode>> = [
+  { value: 'auto', label: 'Auto', description: 'Route model choice from the request.', icon: Gauge },
+  { value: 'low', label: 'Low', description: 'Prefer speed over depth.', icon: Gauge },
+  { value: 'balanced', label: 'Balanced', description: 'Default quality and speed tradeoff.', icon: Gauge },
+  { value: 'high', label: 'High', description: 'Spend more effort on harder prompts.', icon: Gauge },
+  { value: 'extra-high', label: 'Extra High', description: 'Use the deepest pass for demanding work.', icon: Gauge },
+]
 
 function timeAgo(ms: number): string {
   const diff = Date.now() - ms
@@ -63,6 +101,15 @@ function fuzzyMatch(query: string, target: string): boolean {
   return qi === q.length
 }
 
+function getContentTypeBadge(doc: Doc): { Icon: LucideIcon; label: string } | null {
+  if (!doc.preview_blocks || doc.preview_blocks.length === 0) return null
+  const types = doc.preview_blocks.map(b => b.type)
+  if (types.includes('code')) return { Icon: Code2, label: 'Code' }
+  if (types.includes('table')) return { Icon: Table2, label: 'Table' }
+  if (types.includes('task')) return { Icon: ListChecks, label: 'Tasks' }
+  return null
+}
+
 function filterDocs(docs: Doc[], query: string): Doc[] {
   if (!query.trim()) return docs
   const q = query.trim()
@@ -78,39 +125,264 @@ function filterDocs(docs: Doc[], query: string): Doc[] {
   })
 }
 
+function getAgentTaskLabel(task: Exclude<AgentTaskMode, 'auto'>): string {
+  switch (task) {
+    case 'review':
+      return 'Review'
+    case 'expand':
+      return 'Expand'
+    case 'proofread':
+      return 'Proofread'
+    case 'summarize':
+      return 'Summarize'
+  }
+}
+
+function inferAgentTask(prompt: string): Exclude<AgentTaskMode, 'auto'> {
+  const lower = prompt.toLowerCase()
+  if (/(proof|grammar|spelling|punctuation|typo|copyedit)/.test(lower)) return 'proofread'
+  if (/(summary|summarize|tl;dr|overview|recap|brief)/.test(lower)) return 'summarize'
+  if (/(expand|deepen|detail|elaborate|example|flesh out)/.test(lower)) return 'expand'
+  return 'review'
+}
+
+function resolveAgentTask(task: AgentTaskMode, prompt: string): Exclude<AgentTaskMode, 'auto'> {
+  return task === 'auto' ? inferAgentTask(prompt) : task
+}
+
+function resolveAgentModelLabel(
+  effort: AgentEffortMode,
+  task: Exclude<AgentTaskMode, 'auto'>,
+  prompt: string
+): string {
+  const lower = prompt.toLowerCase()
+  switch (effort) {
+    case 'low':
+      return task === 'proofread' || task === 'summarize' ? 'Claude Haiku' : 'Claude Sonnet'
+    case 'balanced':
+      return 'Claude Sonnet'
+    case 'high':
+    case 'extra-high':
+      return 'Claude Opus'
+    case 'auto':
+      if (task === 'proofread' || task === 'summarize') return 'Claude Haiku'
+      if (/(deep|thorough|critique|logic|argument|strategy|analy[sz]e|recruiter)/.test(lower)) return 'Claude Opus'
+      return 'Claude Sonnet'
+  }
+}
+
+function InlineDropdown<T extends string>({
+  label,
+  value,
+  options,
+  open,
+  onToggle,
+  onSelect,
+  searchable,
+}: {
+  label: string
+  value: T
+  options: Array<DropdownOption<T>>
+  open: boolean
+  onToggle: () => void
+  onSelect: (value: T) => void
+  searchable?: boolean
+}) {
+  const selected = options.find(option => option.value === value) ?? options[0]
+  const TriggerIcon = selected.icon
+  const [dropdownQuery, setDropdownQuery] = useState('')
+  const dropdownSearchRef = useRef<HTMLInputElement>(null)
+
+  const filteredOptions = searchable && dropdownQuery.trim()
+    ? options.filter(o =>
+        o.label.toLowerCase().includes(dropdownQuery.toLowerCase()) ||
+        o.description.toLowerCase().includes(dropdownQuery.toLowerCase())
+      )
+    : options
+
+  useEffect(() => {
+    if (open && searchable) {
+      requestAnimationFrame(() => dropdownSearchRef.current?.focus())
+    }
+    if (!open) setDropdownQuery('')
+  }, [open, searchable])
+
+  return (
+    <div className="agent-dropdown" data-agent-dropdown-root="true">
+      <button
+        type="button"
+        className={`agent-dropdown-trigger${open ? ' open' : ''}`}
+        onClick={onToggle}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={label}
+      >
+        <TriggerIcon size={14} strokeWidth={2} className="agent-dropdown-trigger-icon" />
+        <span>{selected.label}</span>
+        <ChevronDown size={14} strokeWidth={2.2} className="agent-dropdown-trigger-chevron" />
+      </button>
+
+      {open && (
+        <div className="agent-dropdown-menu" role="menu">
+          {searchable && (
+            <div className="agent-dropdown-search-wrap">
+              <Search size={14} strokeWidth={2} className="agent-dropdown-search-icon" />
+              <input
+                ref={dropdownSearchRef}
+                className="agent-dropdown-search"
+                type="text"
+                placeholder="Search…"
+                value={dropdownQuery}
+                onChange={e => setDropdownQuery(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+          )}
+          <div className={searchable ? 'agent-dropdown-list' : undefined}>
+            {filteredOptions.length === 0 ? (
+              <div className="agent-dropdown-empty">No results</div>
+            ) : (
+              filteredOptions.map(option => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`agent-dropdown-item${option.value === value ? ' selected' : ''}`}
+                  onClick={() => onSelect(option.value)}
+                  role="menuitemradio"
+                  aria-checked={option.value === value}
+                >
+                  <div className="agent-dropdown-copy">
+                    <div className="agent-dropdown-title">{option.label}</div>
+                    <div className="agent-dropdown-subtitle">{option.description}</div>
+                  </div>
+                  {option.value === value && <Check size={14} strokeWidth={2.4} className="agent-dropdown-check" />}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function DocRow({
-  doc, onOpen, onDelete, deleting, highlighted, style, hideDelete,
+  doc, onOpen, onDelete, onRename, deleting, highlighted, hideDelete, sharedBy,
 }: {
   doc: Doc
   onOpen: () => void
   onDelete: (e: React.MouseEvent) => void
+  onRename: (newTitle: string) => void
   deleting: boolean
   highlighted: boolean
-  style?: CSSProperties
   hideDelete?: boolean
+  sharedBy?: string
 }) {
   const excerpt = getExcerpt(doc)
+  const badge = getContentTypeBadge(doc)
+  const collaborators = doc.collaborators ?? []
+
+  const [renaming, setRenaming] = useState(false)
+  const [renameDraft, setRenameDraft] = useState(doc.title || '')
+  const renameRef = useRef<HTMLInputElement>(null)
+
+  const startRename = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setRenameDraft(doc.title || '')
+    setRenaming(true)
+  }
+
+  const commitRename = () => {
+    setRenaming(false)
+    const trimmed = renameDraft.trim()
+    if (trimmed && trimmed !== doc.title) onRename(trimmed)
+    else setRenameDraft(doc.title || '')
+  }
+
+  const cancelRename = () => {
+    setRenaming(false)
+    setRenameDraft(doc.title || '')
+  }
+
+  useEffect(() => {
+    if (renaming) {
+      requestAnimationFrame(() => {
+        renameRef.current?.focus()
+        renameRef.current?.select()
+      })
+    }
+  }, [renaming])
+
+  // Keep draft in sync if title changes externally
+  useEffect(() => {
+    if (!renaming) setRenameDraft(doc.title || '')
+  }, [doc.title, renaming])
 
   return (
     <div
-      style={style}
-      className={`doc-row${highlighted ? ' doc-row--highlighted' : ''}`}
-      onClick={onOpen}
+      className={`doc-row${highlighted ? ' doc-row--highlighted' : ''}${renaming ? ' doc-row--renaming' : ''}`}
+      onClick={renaming ? undefined : onOpen}
       onKeyDown={e => {
+        if (renaming) return
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen() }
       }}
-      tabIndex={0}
+      tabIndex={renaming ? -1 : 0}
       role="button"
       aria-label={`Open ${doc.title || 'Untitled'}`}
     >
       <div className="doc-row-icon" aria-hidden="true">
-        <FileText size={17} strokeWidth={1.6} />
+        {badge ? <badge.Icon size={16} strokeWidth={1.65} /> : <FileText size={17} strokeWidth={1.6} />}
       </div>
+
       <div className="doc-row-body">
-        <span className="doc-row-title">{doc.title || 'Untitled'}</span>
-        {excerpt && <span className="doc-row-excerpt">{excerpt}</span>}
+        {renaming ? (
+          <input
+            ref={renameRef}
+            className="doc-row-rename-input"
+            value={renameDraft}
+            onChange={e => setRenameDraft(e.target.value)}
+            onBlur={commitRename}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); commitRename() }
+              if (e.key === 'Escape') { e.preventDefault(); cancelRename() }
+            }}
+            onClick={e => e.stopPropagation()}
+            maxLength={128}
+          />
+        ) : (
+          <span className="doc-row-title">{doc.title || 'Untitled'}</span>
+        )}
+        {!renaming && excerpt && <span className="doc-row-excerpt">{excerpt}</span>}
       </div>
+
+      {collaborators.length > 0 && !sharedBy && (
+        <div className="doc-row-avatars">
+          {collaborators.slice(0, 3).map(c => (
+            <div key={c.id} className="doc-row-avatar" style={{ background: c.color }} title={c.name}>
+              {c.name[0].toUpperCase()}
+            </div>
+          ))}
+          {collaborators.length > 3 && (
+            <div className="doc-row-avatar doc-row-avatar--overflow">+{collaborators.length - 3}</div>
+          )}
+        </div>
+      )}
+
+      {sharedBy && <span className="doc-row-shared-by">from {sharedBy.split(' ')[0]}</span>}
+
       <span className="doc-row-meta">{timeAgo(doc.updated_at)}</span>
+
+      {!hideDelete && !renaming && (
+        <button
+          className="doc-row-rename-btn"
+          onClick={startRename}
+          title="Rename document"
+          tabIndex={-1}
+        >
+          <Pencil size={13} strokeWidth={1.75} />
+        </button>
+      )}
       {!hideDelete && (
         <button
           className={`doc-row-del${deleting ? ' del--busy' : ''}`}
@@ -127,23 +399,56 @@ function DocRow({
 }
 
 export default function Home() {
+  const { user } = useAuth()
   const [docs, setDocs] = useState<Doc[]>([])
   const [sharedDocs, setSharedDocs] = useState<SharedDoc[]>([])
   const [loading, setLoading] = useState(true)
   const [deletingRoom, setDeletingRoom] = useState<string | null>(null)
-  const [userName, setUserName] = useState(storedUser.name || '')
-  const [nameDraft, setNameDraft] = useState(storedUser.name || '')
-  const [isEditingName, setIsEditingName] = useState(false)
   const [resolvedTheme, setResolvedTheme] = useState<'dark' | 'light'>('dark')
   const [query, setQuery] = useState('')
   const [searchFocused, setSearchFocused] = useState(false)
   const [highlightedIndex, setHighlightedIndex] = useState<number>(-1)
-  const nameRef = useRef<HTMLInputElement>(null)
+  const [agentPrompt, setAgentPrompt] = useState('')
+  const [agentTask, setAgentTask] = useState<AgentTaskMode>('auto')
+  const [agentEffort, setAgentEffort] = useState<AgentEffortMode>('auto')
+  const [openAgentDropdown, setOpenAgentDropdown] = useState<'document' | 'task' | 'effort' | null>(null)
+  const [selectedAgentRoom, setSelectedAgentRoom] = useState('')
+  const [agentComposerStatus, setAgentComposerStatus] = useState('')
+  const [bannerDismissed, setBannerDismissed] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
   const navigate = useNavigate()
 
-  const hasName = !!userName
-  const filteredDocs = filterDocs(docs, query)
+  type ListDoc = Doc & { _sharedBy?: string }
+  const uniqueSharedDocs = sharedDocs.filter(s => !docs.some(d => d.room === s.room))
+  const allDocs: ListDoc[] = [
+    ...docs,
+    ...uniqueSharedDocs.map(s => ({ ...s, _sharedBy: s.owner_name })),
+  ]
+  const filteredDocs: ListDoc[] = filterDocs(allDocs, query)
+  const ownedComposerDocs: ComposerDoc[] = docs.map(doc => ({ ...doc, source: 'Owned' }))
+  const sharedComposerDocs: ComposerDoc[] = sharedDocs
+    .filter(sharedDoc => !docs.some(doc => doc.room === sharedDoc.room))
+    .map(doc => ({ ...doc, source: 'Shared', owner_name: doc.owner_name }))
+  const composerDocs = [...ownedComposerDocs, ...sharedComposerDocs]
+  const selectedComposerDoc = composerDocs.find(doc => doc.room === selectedAgentRoom) ?? null
+  const documentDropdownOptions: Array<DropdownOption<string>> = composerDocs.length > 0
+    ? composerDocs.map(doc => ({
+      value: doc.room,
+      label: doc.title || 'Untitled',
+      description: doc.source === 'Owned'
+        ? `Your document · updated ${timeAgo(doc.updated_at)}.`
+        : `Shared${doc.owner_name ? ` by ${doc.owner_name}` : ''} · updated ${timeAgo(doc.updated_at)}.`,
+      icon: FileText,
+    }))
+    : [{
+      value: '',
+      label: 'No documents',
+      description: 'Create a document first to target an agent.',
+      icon: FileText,
+    }]
+  const resolvedAgentTask = resolveAgentTask(agentTask, agentPrompt)
+  const resolvedModelLabel = resolveAgentModelLabel(agentEffort, resolvedAgentTask, agentPrompt)
+  const canSubmitAgent = !!selectedComposerDoc && agentPrompt.trim().length > 0
 
   useEffect(() => {
     const saved = localStorage.getItem('cowrite-theme') as string
@@ -166,19 +471,23 @@ export default function Home() {
     }
   }, [])
 
+  // Real-time SSE updates
   useEffect(() => {
-    if (!isEditingName) return
-    const frame = requestAnimationFrame(() => {
-      nameRef.current?.focus()
-      nameRef.current?.setSelectionRange(nameDraft.length, nameDraft.length)
+    return connectEvents((e: ServerEvent) => {
+      if (e.type === 'doc:shared') {
+        const doc = e.payload as unknown as SharedDoc
+        setSharedDocs(prev => prev.some(d => d.room === doc.room) ? prev : [doc, ...prev])
+      } else if (e.type === 'doc:unshared') {
+        setSharedDocs(prev => prev.filter(d => d.room !== e.payload.room))
+      } else if (e.type === 'doc:deleted') {
+        setSharedDocs(prev => prev.filter(d => d.room !== e.payload.room))
+      }
     })
-    return () => cancelAnimationFrame(frame)
-  }, [isEditingName])
+  }, [])
 
   // Keyboard shortcut: / or Cmd+K focuses search
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!hasName) return
       const active = document.activeElement
       const isInput = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement
       if (e.key === '/' && !isInput) {
@@ -192,7 +501,7 @@ export default function Home() {
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [hasName])
+  }, [])
 
   // Arrow key navigation through results
   const handleSearchKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -219,51 +528,83 @@ export default function Home() {
   // Reset highlight when query changes
   useEffect(() => { setHighlightedIndex(-1) }, [query])
 
-  const startNameEdit = () => {
-    setNameDraft(userName)
-    setIsEditingName(true)
-  }
+  useEffect(() => {
+    if (composerDocs.length === 0) {
+      if (selectedAgentRoom) setSelectedAgentRoom('')
+      return
+    }
 
-  const commitName = () => {
-    const name = nameDraft.trim()
-    setIsEditingName(false)
-    if (!name) { setNameDraft(userName); return }
-    const updated = updateUserName(name)
-    setUserName(name)
-    setNameDraft(name)
-    registerUser({ id: updated.id, name, color: updated.color })
-  }
-
-  const cancelNameEdit = () => {
-    setNameDraft(userName)
-    setIsEditingName(false)
-  }
+    setBannerDismissed(false)
+    if (!selectedAgentRoom || !composerDocs.some(doc => doc.room === selectedAgentRoom)) {
+      setSelectedAgentRoom(composerDocs[0].room)
+    }
+  }, [composerDocs, selectedAgentRoom])
 
   useEffect(() => {
-    if (!storedUser.id || !hasName) return
+    if (!agentComposerStatus) return
+    const timeout = window.setTimeout(() => setAgentComposerStatus(''), 2200)
+    return () => window.clearTimeout(timeout)
+  }, [agentComposerStatus])
+
+  useEffect(() => {
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      if (!target.closest('[data-agent-dropdown-root="true"]')) {
+        setOpenAgentDropdown(null)
+      }
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpenAgentDropdown(null)
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleEscape)
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [])
+
+  useEffect(() => {
     Promise.all([
-      getUserDocuments(storedUser.id).then(setDocs),
-      getSharedDocuments(storedUser.id).then(setSharedDocs),
+      getUserDocuments().then(setDocs),
+      getSharedDocuments().then(setSharedDocs),
     ]).finally(() => setLoading(false))
     const t = setTimeout(() => {
-      getUserDocuments(storedUser.id).then(setDocs)
-      getSharedDocuments(storedUser.id).then(setSharedDocs)
+      getUserDocuments().then(setDocs)
+      getSharedDocuments().then(setSharedDocs)
     }, 1200)
     return () => clearTimeout(t)
-  }, [hasName])
+  }, [])
 
   const handleCreate = async () => {
     const id = crypto.randomUUID()
-    await createDocument(id, storedUser.id)
+    await createDocument(id)
     navigate(`/doc/${id}`)
   }
 
   const handleDelete = async (room: string, e: React.MouseEvent) => {
     e.stopPropagation()
     setDeletingRoom(room)
-    const result = await deleteDocument(room, storedUser.id)
+    const result = await deleteDocument(room)
     if (result?.success) setDocs(prev => prev.filter(d => d.room !== room))
     setDeletingRoom(null)
+  }
+
+  const handleRename = async (room: string, newTitle: string) => {
+    setDocs(prev => prev.map(d => d.room === room ? { ...d, title: newTitle } : d))
+    await renameDocument(room, newTitle)
+  }
+
+  const handleAgentComposerSubmit = () => {
+    if (!selectedComposerDoc || !agentPrompt.trim()) return
+
+    setAgentComposerStatus(
+      `${getAgentTaskLabel(resolvedAgentTask)} queued locally for ${selectedComposerDoc.title || 'Untitled'} with ${resolvedModelLabel}.`
+    )
   }
 
   const logoSrc = resolvedTheme === 'light' ? '/cowrite_lightmode.svg' : '/cowrite_darkmode.svg'
@@ -277,17 +618,29 @@ export default function Home() {
       <nav className="home-nav">
         <img src={logoSrc} alt="CoWrite" className="home-nav-logo" />
         <div className="home-nav-right">
-          {hasName && (
-            <div className="home-avatar" style={{ background: storedUser.color }} aria-label={userName}>
-              {userName[0].toUpperCase()}
+          {user?.avatar_url ? (
+            <img
+              src={user.avatar_url}
+              alt={user.name}
+              className="home-avatar home-avatar--photo"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <div className="home-avatar" style={{ background: user?.color }} aria-label={user?.name}>
+              {user?.name?.[0]?.toUpperCase()}
             </div>
           )}
-          {hasName && (
-            <button className="home-btn-new" onClick={handleCreate}>
-              <Plus size={15} strokeWidth={2} />
-              New
-            </button>
-          )}
+          <button className="home-btn-new" onClick={handleCreate}>
+            <Plus size={15} strokeWidth={2} />
+            New
+          </button>
+          <button
+            className="home-btn-logout"
+            onClick={async () => { await logout(); window.location.href = '/login' }}
+            title="Sign out"
+          >
+            <LogOut size={15} strokeWidth={2} />
+          </button>
         </div>
       </nav>
 
@@ -295,177 +648,189 @@ export default function Home() {
         <div className="home-hero-inner">
           <div className="home-hero-content">
             <p className="home-greeting">{greeting()}</p>
-            {isEditingName ? (
-              <>
-                <h1 className="home-hero-name">
-                  <input
-                    ref={nameRef}
-                    className="home-hero-name-editor"
-                    type="text"
-                    dir="ltr"
-                    inputMode="text"
-                    autoCapitalize="words"
-                    autoComplete="name"
-                    spellCheck={false}
-                    aria-label="Your name"
-                    aria-describedby="home-name-helper"
-                    value={nameDraft}
-                    onBlur={commitName}
-                    onChange={e => setNameDraft(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') { e.preventDefault(); commitName() }
-                      if (e.key === 'Escape') { e.preventDefault(); cancelNameEdit() }
-                    }}
-                    maxLength={32}
-                    style={{ width: `${Math.max(nameDraft.length || 0, 8)}ch` }}
-                  />
-                </h1>
-                <p className="home-hero-helper" id="home-name-helper">
-                  Enter to save · Esc to cancel
-                </p>
-              </>
-            ) : hasName ? (
-              <button className="home-hero-name-button" onClick={startNameEdit} type="button">
-                <span className="home-hero-name">{userName}.</span>
-              </button>
-            ) : (
-              <button
-                className="home-hero-name-button home-hero-name-button--placeholder"
-                onClick={startNameEdit}
-                type="button"
-              >
-                <span className="home-hero-name home-hero-name--placeholder">Your name</span>
-              </button>
-            )}
+            <h1 className="home-hero-name">{user?.name?.split(' ')[0]}.</h1>
           </div>
         </div>
       </section>
 
-      {hasName && (
-        <main className="home-main">
-          <section className="home-section">
-
-            {/* Search bar */}
-            <div className={`doc-search-wrap${searchFocused ? ' focused' : ''}`}>
-              <Search size={16} strokeWidth={2} className="doc-search-icon" aria-hidden="true" />
-              <input
-                ref={searchRef}
-                className="doc-search-input"
-                type="text"
-                placeholder="Search documents…"
-                value={query}
-                onChange={e => setQuery(e.target.value)}
-                onFocus={() => setSearchFocused(true)}
-                onBlur={() => { setSearchFocused(false); setHighlightedIndex(-1) }}
-                onKeyDown={handleSearchKeyDown}
-                aria-label="Search documents"
-                autoComplete="off"
-                spellCheck={false}
+      <main className="home-main">
+          <section className="agent-composer-inline">
+            <div className="agent-composer-wrap">
+            <form
+              className="agent-composer-shell"
+              onSubmit={e => {
+                e.preventDefault()
+                handleAgentComposerSubmit()
+              }}
+            >
+              <textarea
+                id="agent-prompt"
+                className="agent-composer-input"
+                value={agentPrompt}
+                onChange={e => setAgentPrompt(e.target.value)}
+                placeholder="Tell an agent what to do with one of your documents..."
+                rows={2}
               />
-              <kbd className="doc-search-hint">
-                {typeof navigator !== 'undefined' && /Mac/.test(navigator.platform) ? '⌘K' : '/'}
-              </kbd>
 
-              {/* Smart suggestions dropdown */}
-              {showSuggestions && (
-                <div className="doc-search-suggestions">
-                  <div className="doc-search-suggestions-label">Recent</div>
-                  {suggestions.map(doc => (
-                    <button
-                      key={doc.room}
-                      className="doc-search-suggestion-item"
-                      onMouseDown={e => { e.preventDefault(); navigate(`/doc/${doc.room}`) }}
-                    >
-                      <FileText size={15} strokeWidth={1.65} />
-                      <span className="doc-search-suggestion-title">{doc.title || 'Untitled'}</span>
-                      <span className="doc-search-suggestion-meta">{timeAgo(doc.updated_at)}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+              <div className="agent-toolbar">
+                <div className="agent-toolbar-controls">
+                  <InlineDropdown
+                    label="Select document"
+                    value={selectedAgentRoom}
+                    options={documentDropdownOptions}
+                    open={openAgentDropdown === 'document'}
+                    onToggle={() => setOpenAgentDropdown(current => current === 'document' ? null : 'document')}
+                    onSelect={value => {
+                      setSelectedAgentRoom(value)
+                      setOpenAgentDropdown(null)
+                    }}
+                    searchable
+                  />
 
-            {/* Document list */}
-            <div className="home-section-body">
-              {loading ? (
-                <div className="home-loading"><div className="home-spinner" /></div>
-              ) : docs.length === 0 ? (
-                <div className="home-empty">
-                  <FilePlus size={32} strokeWidth={1.25} className="home-empty-icon" />
-                  <p className="home-empty-text">No documents yet</p>
-                  <button className="home-empty-btn" onClick={handleCreate}>
-                    Start writing <ArrowRight size={13} strokeWidth={2} />
-                  </button>
+                  <InlineDropdown
+                    label="Select work type"
+                    value={agentTask}
+                    options={AGENT_TASK_OPTIONS}
+                    open={openAgentDropdown === 'task'}
+                    onToggle={() => setOpenAgentDropdown(current => current === 'task' ? null : 'task')}
+                    onSelect={value => {
+                      setAgentTask(value)
+                      setOpenAgentDropdown(null)
+                    }}
+                  />
+
+                  <InlineDropdown
+                    label="Select thinking effort"
+                    value={agentEffort}
+                    options={AGENT_EFFORT_OPTIONS}
+                    open={openAgentDropdown === 'effort'}
+                    onToggle={() => setOpenAgentDropdown(current => current === 'effort' ? null : 'effort')}
+                    onSelect={value => {
+                      setAgentEffort(value)
+                      setOpenAgentDropdown(null)
+                    }}
+                  />
                 </div>
-              ) : (
-                <div className="doc-list" onMouseMove={() => setHighlightedIndex(-1)}>
-                  {/* New document row */}
+
+                <div className="agent-toolbar-actions">
                   <button
-                    className="doc-row doc-row--new"
-                    onClick={handleCreate}
-                    style={{ '--stagger': '80ms' } as CSSProperties}
+                    type="submit"
+                    className="agent-send-button"
+                    disabled={!canSubmitAgent}
+                    aria-label="Run agent"
                   >
-                    <div className="doc-row-icon doc-row-icon--new" aria-hidden="true">
-                      <Plus size={16} strokeWidth={2.1} />
-                    </div>
-                    <div className="doc-row-body">
-                      <span className="doc-row-title">New document</span>
-                    </div>
+                    <ArrowUp size={18} strokeWidth={2.4} />
                   </button>
-
-                  {/* No results */}
-                  {query && filteredDocs.length === 0 && (
-                    <div className="doc-list-empty-search">
-                      No documents matching <strong>"{query}"</strong>
-                    </div>
-                  )}
-
-                  {filteredDocs.map((doc, index) => (
-                    <DocRow
-                      key={doc.room}
-                      doc={doc}
-                      onOpen={() => navigate(`/doc/${doc.room}`)}
-                      onDelete={e => handleDelete(doc.room, e)}
-                      deleting={deletingRoom === doc.room}
-                      highlighted={index === highlightedIndex}
-                      style={{ '--stagger': `${140 + index * 40}ms` } as CSSProperties}
-                    />
-                  ))}
                 </div>
-              )}
+              </div>
+
+            </form>
+            {(agentComposerStatus || (composerDocs.length === 0 && !bannerDismissed)) && (
+              <div className="agent-composer-banner">
+                <span>{agentComposerStatus || 'Create a document first to target an agent.'}</span>
+                <button
+                  className="agent-composer-banner-close"
+                  onClick={() => { setAgentComposerStatus(''); setBannerDismissed(true) }}
+                  aria-label="Dismiss"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             </div>
           </section>
 
-          {/* Shared with you */}
-          {!loading && sharedDocs.length > 0 && (
-            <section className="home-section">
-              <h2 className="home-section-heading">Shared with you</h2>
+          <section className="home-section">
+            <div className="home-docs-panel">
+              <div className={`doc-search-wrap${searchFocused ? ' focused' : ''}`}>
+                <Search size={16} strokeWidth={2} className="doc-search-icon" aria-hidden="true" />
+                <input
+                  ref={searchRef}
+                  className="doc-search-input"
+                  type="text"
+                  placeholder="Search documents…"
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  onFocus={() => setSearchFocused(true)}
+                  onBlur={() => { setSearchFocused(false); setHighlightedIndex(-1) }}
+                  onKeyDown={handleSearchKeyDown}
+                  aria-label="Search documents"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <kbd className="doc-search-hint">
+                  {typeof navigator !== 'undefined' && /Mac/.test(navigator.platform) ? '⌘K' : '/'}
+                </kbd>
+
+                {showSuggestions && (
+                  <div className="doc-search-suggestions">
+                    <div className="doc-search-suggestions-label">Recent</div>
+                    {suggestions.map(doc => (
+                      <button
+                        key={doc.room}
+                        className="doc-search-suggestion-item"
+                        onMouseDown={e => { e.preventDefault(); navigate(`/doc/${doc.room}`) }}
+                      >
+                        <FileText size={15} strokeWidth={1.65} />
+                        <span className="doc-search-suggestion-title">{doc.title || 'Untitled'}</span>
+                        <span className="doc-search-suggestion-meta">{timeAgo(doc.updated_at)}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div className="home-section-body">
-                <div className="doc-list">
-                  {filterDocs(sharedDocs, query).map((doc, index) => (
-                    <div key={doc.room} className="doc-row-shared-wrap" style={{ '--stagger': `${140 + index * 40}ms` } as CSSProperties}>
+                {loading ? (
+                  <div className="home-loading"><div className="home-spinner" /></div>
+                ) : allDocs.length === 0 ? (
+                  <div className="home-empty home-empty--panel">
+                    <FilePlus size={32} strokeWidth={1.25} className="home-empty-icon" />
+                    <p className="home-empty-text">No documents yet</p>
+                    <button className="home-empty-btn" onClick={handleCreate}>
+                      Start writing <ArrowRight size={13} strokeWidth={2} />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="doc-list doc-list--flush" onMouseMove={() => setHighlightedIndex(-1)}>
+                    <button
+                      className="doc-row doc-row--new"
+                      onClick={handleCreate}
+                    >
+                      <div className="doc-row-icon doc-row-icon--new" aria-hidden="true">
+                        <Plus size={16} strokeWidth={2.1} />
+                      </div>
+                      <div className="doc-row-body">
+                        <span className="doc-row-title">New document</span>
+                      </div>
+                    </button>
+
+                    {query && filteredDocs.length === 0 && (
+                      <div className="doc-list-empty-search">
+                        No documents matching <strong>"{query}"</strong>
+                      </div>
+                    )}
+
+                    {filteredDocs.map((doc, index) => (
                       <DocRow
+                        key={doc.room}
                         doc={doc}
                         onOpen={() => navigate(`/doc/${doc.room}`)}
-                        onDelete={() => {}}
-                        deleting={false}
-                        highlighted={false}
-                        hideDelete
+                        onDelete={e => doc._sharedBy ? e.stopPropagation() : handleDelete(doc.room, e)}
+                        onRename={newTitle => doc._sharedBy ? undefined : handleRename(doc.room, newTitle)}
+                        deleting={deletingRoom === doc.room}
+                        highlighted={index === highlightedIndex}
+                        hideDelete={!!doc._sharedBy}
+                        sharedBy={doc._sharedBy}
                       />
-                      <div className="doc-row-shared-by">
-                        <div className="doc-row-shared-avatar" style={{ background: (doc as SharedDoc).owner_color }}>
-                          {(doc as SharedDoc).owner_name[0]}
-                        </div>
-                        <span>{(doc as SharedDoc).owner_name}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                    ))}
+                  </div>
+                )}
               </div>
-            </section>
-          )}
+            </div>
+          </section>
+
         </main>
-      )}
     </div>
   )
 }

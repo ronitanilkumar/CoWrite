@@ -1,5 +1,6 @@
 import { useEditor, EditorContent, Extension, NodeViewWrapper, NodeViewContent, ReactNodeViewRenderer } from '@tiptap/react'
-import { TextSelection } from '@tiptap/pm/state'
+import { TextSelection, Plugin, PluginKey } from '@tiptap/pm/state'
+import { DecorationSet, Decoration } from '@tiptap/pm/view'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Collaboration from '@tiptap/extension-collaboration'
@@ -17,8 +18,8 @@ import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { getOrCreateUser } from './user'
-import { registerUser, createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument } from './api'
+import { useAuth } from './AuthContext'
+import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, type DocPrefs } from './api'
 import { createPortal } from 'react-dom'
 import {
   Heading1, Heading2, Heading3, List, ListOrdered,
@@ -33,6 +34,68 @@ import {
 import './App.css'
 
 const lowlight = createLowlight(common)
+
+function ClaudeIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="m4.714 15.956l4.718-2.648l.079-.23l-.08-.128h-.23l-.79-.048l-2.695-.073l-2.337-.097l-2.265-.122l-.57-.121l-.535-.704l.055-.353l.48-.321l.685.06l1.518.104l2.277.157l1.651.098l2.447.255h.389l.054-.158l-.133-.097l-.103-.098l-2.356-1.596l-2.55-1.688l-1.336-.972l-.722-.491L2 6.223l-.158-1.008l.656-.722l.88.06l.224.061l.893.686l1.906 1.476l2.49 1.833l.364.304l.146-.104l.018-.072l-.164-.274l-1.354-2.446l-1.445-2.49l-.644-1.032l-.17-.619a3 3 0 0 1-.103-.729L6.287.133L6.7 0l.995.134l.42.364l.619 1.415L9.735 4.14l1.555 3.03l.455.898l.243.832l.09.255h.159V9.01l.127-1.706l.237-2.095l.23-2.695l.08-.76l.376-.91l.747-.492l.583.28l.48.685l-.067.444l-.286 1.851l-.558 2.903l-.365 1.942h.213l.243-.242l.983-1.306l1.652-2.064l.728-.82l.85-.904l.547-.431h1.032l.759 1.129l-.34 1.166l-1.063 1.347l-.88 1.142l-1.263 1.7l-.79 1.36l.074.11l.188-.02l2.853-.606l1.542-.28l1.84-.315l.832.388l.09.395l-.327.807l-1.967.486l-2.307.462l-3.436.813l-.043.03l.049.061l1.548.146l.662.036h1.62l3.018.225l.79.522l.473.638l-.08.485l-1.213.62l-1.64-.389l-3.825-.91l-1.31-.329h-.183v.11l1.093 1.068l2.003 1.81l2.508 2.33l.127.578l-.321.455l-.34-.049l-2.204-1.657l-.85-.747l-1.925-1.62h-.127v.17l.443.649l2.343 3.521l.122 1.08l-.17.353l-.607.213l-.668-.122l-1.372-1.924l-1.415-2.168l-1.141-1.943l-.14.08l-.674 7.254l-.316.37l-.728.28l-.607-.461l-.322-.747l.322-1.476l.388-1.924l.316-1.53l.285-1.9l.17-.632l-.012-.042l-.14.018l-1.432 1.967l-2.18 2.945l-1.724 1.845l-.413.164l-.716-.37l.066-.662l.401-.589l2.386-3.036l1.439-1.882l.929-1.086l-.006-.158h-.055L4.138 18.56l-1.13.146l-.485-.456l.06-.746l.231-.243l1.907-1.312Z" />
+    </svg>
+  )
+}
+
+// ── AI fade-out highlight plugin ─────────────────────────────────────
+const aiDecoKey = new PluginKey<DecorationSet>('aiDecorations')
+
+function buildAIDecos(doc: any, from: number, to: number): DecorationSet {
+  from = Math.max(0, from)
+  to = Math.min(doc.content.size, to)
+  if (from >= to) return DecorationSet.empty
+  const decos: Decoration[] = []
+  doc.nodesBetween(from, to, (node: any, pos: number) => {
+    if (!node.isBlock || node.childCount === 0) return
+    decos.push(Decoration.node(pos, pos + node.nodeSize, { class: 'ai-highlight-fade' }))
+  })
+  if (decos.length === 0) return DecorationSet.empty
+  return DecorationSet.create(doc, decos)
+}
+
+function makeAIDecoPlugin() {
+  return new Plugin({
+    key: aiDecoKey,
+    state: {
+      init: () => DecorationSet.empty,
+      apply(tr, set) {
+        const meta = tr.getMeta(aiDecoKey)
+        if (meta === null) return DecorationSet.empty
+        if (meta) return buildAIDecos(tr.doc, meta.from, meta.to)
+        return set.map(tr.mapping, tr.doc)
+      },
+    },
+    props: {
+      decorations(state) { return aiDecoKey.getState(state) },
+    },
+  })
+}
+
+const AI_DECO_EXTENSION = Extension.create({
+  name: 'aiDecorations',
+  addProseMirrorPlugins() { return [makeAIDecoPlugin()] },
+})
+
+/** Convert plain text (with \n\n paragraph breaks) to TipTap-compatible JSON content */
+function convertTextToContent(text: string): any[] {
+  const paragraphs = text.split(/\n{2,}/)
+  return paragraphs.map(p => {
+    if (!p.trim()) return { type: 'paragraph' }
+    const segments = p.split('\n')
+    const content: any[] = []
+    segments.forEach((seg, i) => {
+      if (seg) content.push({ type: 'text', text: seg })
+      if (i < segments.length - 1) content.push({ type: 'hardBreak' })
+    })
+    return { type: 'paragraph', content }
+  })
+}
 
 const LANGUAGES = [
   'plaintext', 'javascript', 'typescript', 'python', 'css', 'html', 'json',
@@ -139,10 +202,9 @@ function CodeBlockView({ node, updateAttributes }: any) {
   )
 }
 
-// storedUser / currentUser are resolved fresh inside Document() at mount time
 
-interface AwarenessUser { name: string; color: string; isYou?: boolean; anchor?: number; lastActive?: number; status?: 'active' | 'idle' }
-interface AwarenessState { user?: AwarenessUser; cursor?: { anchor: number; head: number }; lastActive?: number }
+interface AwarenessUser { name: string; color: string; isYou?: boolean; isAI?: boolean; anchor?: number; lastActive?: number; status?: 'active' | 'idle' }
+interface AwarenessState { user?: AwarenessUser; cursor?: { anchor: number; head: number }; lastActive?: number; aiPresence?: { name: string; color: string; isAI: true; status: 'active'; anchor: number; lastActive: number } }
 
 function throttle<T extends (...args: any[]) => void>(fn: T, ms: number): T {
   let last = 0
@@ -259,7 +321,14 @@ const TaskListExit = Extension.create({
 })
 
 // ── Slash command items ──────────────────────────────────────────────
+const AI_SUBMODES = [
+  { aiMode: 'write' as const,    label: 'Write',    desc: 'Ask AI to write something' },
+  { aiMode: 'continue' as const, label: 'Continue', desc: 'Continue writing from cursor' },
+  { aiMode: 'summarize' as const, label: 'Summarize', desc: 'Summarize this document' },
+]
+
 const slashItems = [
+  { title: 'Ask AI', subtitle: 'Write, continue, or summarize', icon: ClaudeIcon, isAIGroup: true, command: (_e: any) => {} },
   { title: 'Heading 1', subtitle: 'Large section heading', icon: Heading1, command: (e: any) => e.chain().focus().toggleHeading({ level: 1 }).run() },
   { title: 'Heading 2', subtitle: 'Medium section heading', icon: Heading2, command: (e: any) => e.chain().focus().toggleHeading({ level: 2 }).run() },
   { title: 'Heading 3', subtitle: 'Small section heading', icon: Heading3, command: (e: any) => e.chain().focus().toggleHeading({ level: 3 }).run() },
@@ -281,32 +350,73 @@ function SlashAlignJustify({ items, selectedIndex, position, onSelect }: {
   items: typeof slashItems
   selectedIndex: number
   position: { top: number; left: number }
-  onSelect: (item: typeof slashItems[0]) => void
+  onSelect: (item: any) => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
+  const [aiExpanded, setAiExpanded] = useState(false)
 
   useEffect(() => {
     const el = ref.current?.querySelector('.selected')
     el?.scrollIntoView({ block: 'nearest' })
   }, [selectedIndex])
 
+  // Flatten items for selectedIndex tracking: AI group counts as 1 when collapsed, 4 when expanded
+  const flatItems: any[] = []
+  items.forEach(item => {
+    if ((item as any).isAIGroup) {
+      flatItems.push(item)
+      if (aiExpanded) {
+        AI_SUBMODES.forEach(sub => flatItems.push({ ...sub, isAISub: true }))
+      }
+    } else {
+      flatItems.push(item)
+    }
+  })
+
   return createPortal(
     <div className="slash-menu" style={{ top: position.top, left: position.left }} ref={ref}>
-      {items.length === 0
+      {flatItems.length === 0
         ? <div className="slash-menu-empty">No results</div>
-        : items.map((item, i) => {
+        : flatItems.map((item, i) => {
+          if (item.isAISub) {
+            return (
+              <div
+                key={`ai-sub-${item.aiMode}`}
+                className={`slash-menu-item slash-menu-ai-sub ${i === selectedIndex ? 'selected' : ''}`}
+                onMouseDown={e => { e.preventDefault(); onSelect({ isAI: true, aiMode: item.aiMode, promptText: '' }) }}
+              >
+                <div className="slash-menu-ai-sub-icon"><ClaudeIcon size={11} /></div>
+                <div className="slash-menu-text">
+                  <div className="slash-menu-title">{item.label}</div>
+                  <div className="slash-menu-subtitle">{item.desc}</div>
+                </div>
+              </div>
+            )
+          }
           const Icon = item.icon
+          const isGroup = (item as any).isAIGroup
           return (
             <div
               key={item.title}
-              className={`slash-menu-item ${i === selectedIndex ? 'selected' : ''}`}
-              onMouseDown={e => { e.preventDefault(); onSelect(item) }}
+              className={`slash-menu-item ${isGroup ? 'slash-menu-ai-group' : ''} ${i === selectedIndex ? 'selected' : ''}`}
+              onMouseDown={e => {
+                e.preventDefault()
+                if (isGroup) setAiExpanded(v => !v)
+                else onSelect(item)
+              }}
             >
-              <div className="slash-menu-icon"><Icon size={14} strokeWidth={2} /></div>
+              <div className={`slash-menu-icon ${isGroup ? 'slash-menu-ai-icon' : ''}`}>
+                <Icon size={14} strokeWidth={2} />
+              </div>
               <div className="slash-menu-text">
                 <div className="slash-menu-title">{item.title}</div>
                 <div className="slash-menu-subtitle">{item.subtitle}</div>
               </div>
+              {isGroup && (
+                <div className={`slash-menu-ai-chevron ${aiExpanded ? 'open' : ''}`}>
+                  <ChevronDown size={12} strokeWidth={2} />
+                </div>
+              )}
             </div>
           )
         })
@@ -334,8 +444,14 @@ function makeSlashExtension(
             editor.chain().focus().deleteRange(range).run()
             props.command(editor)
           },
-          items: ({ query }: { query: string }) =>
-            slashItems.filter(i => i.title.toLowerCase().includes(query.toLowerCase())),
+          items: ({ query }: { query: string }) => {
+            const lower = query.toLowerCase()
+            if (lower.startsWith('ai ') && query.length > 3) {
+              const promptText = query.slice(3).trim()
+              return [{ title: `AI: "${promptText}"`, subtitle: 'Ask AI to write this', icon: ClaudeIcon, isAIGroup: false, isAI: true, aiMode: 'write' as const, promptText, command: (_e: any) => {} }]
+            }
+            return slashItems.filter(i => i.title.toLowerCase().includes(lower))
+          },
           render: () => ({
             onStart: (props: any) => { suggestionRef.current = props; onOpenOrUpdate(props) },
             onUpdate: (props: any) => { suggestionRef.current = props; onOpenOrUpdate(props) },
@@ -966,9 +1082,8 @@ function CursorOverlay({ editor, provider }: { editor: any; provider: any }) {
 
 // ── App ──────────────────────────────────────────────────────────────
 export default function Document() {
-  // Read fresh from localStorage on every mount so names set on the Home screen are picked up
-  const storedUser = getOrCreateUser()
-  const currentUser = { name: storedUser.name, color: storedUser.color }
+  const { user } = useAuth()
+  const currentUser = { name: user?.name ?? '', color: user?.color ?? '#888' }
 
   const { roomId } = useParams<{ roomId: string }>()
   const navigate = useNavigate()
@@ -996,16 +1111,34 @@ export default function Document() {
     if (saved === 'dark' || saved === 'light') return saved
     return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
   })
-  const [userName] = useState(storedUser.name || '')
+  const userName = user?.name ?? ''
 
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [words, setWords] = useState(0)
   const [inTable, setInTable] = useState(false)
-  const [fullWidth, setFullWidth] = useState(false)
-  const [spellCheck, setSpellCheck] = useState(false)
-  const [editorFont, setEditorFont] = useState<'sans' | 'serif' | 'mono'>('sans')
-  const [editorSize, setEditorSize] = useState<'sm' | 'md' | 'lg'>('md')
-  const [editorLineHeight, setEditorLineHeight] = useState<'compact' | 'normal' | 'spacious'>('normal')
+
+  const defaultPrefs: Required<DocPrefs> = (() => {
+    const fallback: Required<DocPrefs> = {
+      fullWidth: false,
+      spellCheck: false,
+      editorFont: 'sans',
+      editorSize: 'md',
+      editorLineHeight: 'normal',
+    }
+    try {
+      const saved = JSON.parse(localStorage.getItem('cowrite-default-prefs') || '{}')
+      return { ...fallback, ...saved }
+    } catch {
+      return fallback
+    }
+  })()
+
+  const [fullWidth, setFullWidth] = useState(defaultPrefs.fullWidth)
+  const [spellCheck, setSpellCheck] = useState(defaultPrefs.spellCheck)
+  const [editorFont, setEditorFont] = useState<'sans' | 'serif' | 'mono'>(defaultPrefs.editorFont)
+  const [editorSize, setEditorSize] = useState<'sm' | 'md' | 'lg'>(defaultPrefs.editorSize)
+  const [editorLineHeight, setEditorLineHeight] = useState<'compact' | 'normal' | 'spacious'>(defaultPrefs.editorLineHeight)
+  const prefsLoadedRef = useRef(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const settingsRef = useRef<HTMLDivElement>(null)
 
@@ -1039,6 +1172,10 @@ export default function Document() {
   const [slashIdx, setSlashIdx] = useState(0)
   const [slashPos, setSlashPos] = useState({ top: 0, left: 0 })
 
+  const [aiStreaming, setAiStreaming] = useState(false)
+  const [aiError, setAiError] = useState<string | null>(null)
+  const aiInsertPosRef = useRef<number>(0)
+
   useEffect(() => {
     if (!shareOpen) return
     const handler = (e: MouseEvent) => {
@@ -1057,7 +1194,7 @@ export default function Document() {
       getAllUsers().then(setAllUsers),
       getDocShares(roomId).then(setDocSharedWith),
       // Re-fetch owner in case the initial load settled before state was set
-      createDocumentAPI(roomId, storedUser.id).then(doc => {
+      createDocumentAPI(roomId).then(doc => {
         if (doc?.owner_id) setDocOwnerId(doc.owner_id)
       }),
     ])
@@ -1070,21 +1207,21 @@ export default function Document() {
   }, [])
 
   const handleAddShare = useCallback(async (targetUserId: string) => {
-    if (!roomId || !storedUser.id) return
+    if (!roomId) return
     setSharingUserId(targetUserId)
-    await shareDocument(roomId, storedUser.id, targetUserId)
+    await shareDocument(roomId, targetUserId)
     const updated = await getDocShares(roomId)
     setDocSharedWith(updated)
     setSharingUserId(null)
-  }, [roomId, storedUser.id])
+  }, [roomId])
 
   const handleRemoveShare = useCallback(async (targetUserId: string) => {
-    if (!roomId || !storedUser.id) return
+    if (!roomId) return
     setSharingUserId(targetUserId)
-    await unshareDocument(roomId, storedUser.id, targetUserId)
+    await unshareDocument(roomId, targetUserId)
     setDocSharedWith(prev => prev.filter(u => u.id !== targetUserId))
     setSharingUserId(null)
-  }, [roomId, storedUser.id])
+  }, [roomId])
 
   useEffect(() => {
     if (!settingsOpen) return
@@ -1128,6 +1265,33 @@ export default function Document() {
     root.style.setProperty('--editor-line-height', lhMap[editorLineHeight])
   }, [editorFont, editorSize, editorLineHeight])
 
+  // Load per-document prefs from server; overlays the localStorage defaults
+  useEffect(() => {
+    if (!roomId) return
+    let cancelled = false
+    getDocPrefs(roomId).then(prefs => {
+      if (cancelled) return
+      if (prefs.fullWidth !== undefined) setFullWidth(prefs.fullWidth)
+      if (prefs.spellCheck !== undefined) setSpellCheck(prefs.spellCheck)
+      if (prefs.editorFont !== undefined) setEditorFont(prefs.editorFont)
+      if (prefs.editorSize !== undefined) setEditorSize(prefs.editorSize)
+      if (prefs.editorLineHeight !== undefined) setEditorLineHeight(prefs.editorLineHeight)
+      prefsLoadedRef.current = true
+    })
+    return () => { cancelled = true }
+  }, [roomId])
+
+  // Persist prefs when any change, debounced; also mirror to localStorage as the default
+  useEffect(() => {
+    if (!prefsLoadedRef.current || !roomId) return
+    const prefs: DocPrefs = { fullWidth, spellCheck, editorFont, editorSize, editorLineHeight }
+    const t = setTimeout(() => {
+      saveDocPrefs(roomId, prefs)
+      localStorage.setItem('cowrite-default-prefs', JSON.stringify(prefs))
+    }, 500)
+    return () => clearTimeout(t)
+  }, [fullWidth, spellCheck, editorFont, editorSize, editorLineHeight, roomId])
+
   const suggestionPropsRef = useRef<any>(null)
 
   const handleSlashOpenOrUpdate = useCallback((props: any) => {
@@ -1140,6 +1304,82 @@ export default function Document() {
   }, [])
 
   const handleSlashClose = useCallback(() => setSlashOpen(false), [])
+
+  const editorRef = useRef<ReturnType<typeof useEditor>>(null)
+
+
+  const triggerAICommand = useCallback(async (
+    promptText: string,
+    mode: 'write' | 'continue' | 'summarize' | 'rewrite',
+    capturedText?: { fullText: string; cursorOffset: number }
+  ) => {
+    const ed = editorRef.current
+    if (!ed || !roomId || aiStreaming) return
+    const insertPos = ed.state.selection.from
+    aiInsertPosRef.current = insertPos
+
+    provider.awareness.setLocalStateField('aiPresence', {
+      name: 'Claude', color: '#cd6425', isAI: true,
+      status: 'active', anchor: insertPos, lastActive: Date.now(),
+    })
+
+    // Use pre-captured text (avoids stale read after deleteRange)
+    const fullText = capturedText?.fullText ?? ed.getText()
+    const cursorOffset = capturedText?.cursorOffset ?? ed.state.doc.textBetween(0, insertPos, '\n').length
+    const before = mode === 'summarize'
+      ? fullText.slice(0, 8000)
+      : fullText.slice(Math.max(0, cursorOffset - 3000), cursorOffset)
+    const after = mode === 'summarize'
+      ? ''
+      : fullText.slice(cursorOffset, cursorOffset + 1000)
+
+    setAiStreaming(true)
+
+    let currentPos = insertPos
+    await streamAIContent(
+      roomId, promptText, before, after, mode,
+      (token) => {
+        ed.chain().insertContentAt(currentPos, token).run()
+        currentPos = ed.state.selection.from
+        provider.awareness.setLocalStateField('aiPresence', {
+          name: 'Claude', color: '#cd6425', isAI: true,
+          status: 'active', anchor: currentPos, lastActive: Date.now(),
+        })
+      },
+      () => {
+        // Post-process: replace raw text with properly formatted paragraphs
+        if (currentPos > insertPos) {
+          const rawText = ed.state.doc.textBetween(insertPos, currentPos, '\n')
+          // Only reformat if there are paragraph breaks
+          if (rawText.includes('\n\n')) {
+            ed.chain().deleteRange({ from: insertPos, to: currentPos }).run()
+            const content = convertTextToContent(rawText)
+            ed.chain().insertContentAt(insertPos, content).run()
+            currentPos = ed.state.selection.from
+          }
+          // Apply fade-out highlight over the inserted range
+          const decoTr = ed.state.tr.setMeta(aiDecoKey, { from: insertPos, to: currentPos })
+          ed.view.dispatch(decoTr)
+          // Clear decorations after the CSS fade animation finishes (3s)
+          setTimeout(() => {
+            if (!ed.isDestroyed) {
+              const clearTr = ed.state.tr.setMeta(aiDecoKey, null)
+              ed.view.dispatch(clearTr)
+            }
+          }, 3000)
+        }
+        setAiStreaming(false)
+        provider.awareness.setLocalStateField('aiPresence', null)
+      },
+      (err) => {
+        console.error('AI error:', err)
+        setAiError(err.message || 'AI request failed')
+        setAiStreaming(false)
+        provider.awareness.setLocalStateField('aiPresence', null)
+        setTimeout(() => setAiError(null), 5000)
+      }
+    )
+  }, [aiStreaming, roomId, provider])
 
   const slashExtension = useRef(
     makeSlashExtension(suggestionPropsRef, handleSlashOpenOrUpdate, handleSlashClose)
@@ -1169,6 +1409,7 @@ export default function Document() {
         })
       }),
       slashExtension,
+      AI_DECO_EXTENSION,
     ],
     onUpdate({ editor }) {
       const text = editor.getText()
@@ -1178,6 +1419,9 @@ export default function Document() {
       setInTable(editor.isActive('table'))
     },
   })
+
+  // Keep editorRef in sync so triggerAICommand can access editor without dep ordering issues
+  useEffect(() => { editorRef.current = editor }, [editor])
 
   useEffect(() => {
     if (!slashOpen) return
@@ -1197,16 +1441,9 @@ export default function Document() {
   }, [slashOpen, slashItems_, slashIdx])
 
   useEffect(() => {
-    // Register user and ensure document exists
-    if (storedUser.name && storedUser.id) {
-      registerUser({
-        id: storedUser.id,
-        name: storedUser.name,
-        color: storedUser.color,
-      })
-    }
-    if (roomId && storedUser.id) {
-      createDocumentAPI(roomId, storedUser.id).then(doc => {
+    // Ensure document exists server-side
+    if (roomId) {
+      createDocumentAPI(roomId).then(doc => {
         if (doc?.owner_id) setDocOwnerId(doc.owner_id)
       })
     }
@@ -1215,6 +1452,11 @@ export default function Document() {
     provider.awareness.setLocalStateField('lastActive', Date.now())
     const statusHandler = (event: { status: string }) => setConnected(event.status === 'connected')
     provider.on('status', statusHandler)
+
+    // Kicked when access is revoked — server closes WS with code 4403
+    provider.on('connection-close', (event: CloseEvent | null) => {
+      if (event?.code === 4403) navigate('/')
+    })
 
     const syncHandler = (isSynced: boolean) => { if (isSynced) setContentReady(true) }
     provider.on('sync', syncHandler)
@@ -1242,6 +1484,9 @@ export default function Document() {
             status: isIdle ? 'idle' : 'active',
           })
         }
+        if (state?.aiPresence) {
+          users.push({ ...state.aiPresence, isYou: false })
+        }
       })
       setOnlineUsers(users)
     }
@@ -1259,7 +1504,13 @@ export default function Document() {
     }
     yTitle.observe(updateTitle)
 
+    // Navigate home if the doc is deleted while we're editing
+    const disconnectSSE = connectEvents(e => {
+      if (e.type === 'doc:deleted' && e.payload.room === roomId) navigate('/')
+    })
+
     return () => {
+      disconnectSSE()
       provider.awareness.off('change', updateUsers)
       provider.off('status', statusHandler)
       provider.off('sync', syncHandler)
@@ -1389,7 +1640,6 @@ export default function Document() {
             </div>
           </div>
 
-          {/* Right: avatars + word count + sidebar toggle */}
           <div className="topbar-right">
             <div className="topbar-avatars-wrap" ref={avatarRef}>
               <div
@@ -1451,7 +1701,7 @@ export default function Document() {
                 </div>
               )}
             </div>
-            {/* Share button + modal */}
+
             <div className="share-wrap" ref={shareRef}>
               <button
                 className={`topbar-share-btn${shareOpen ? ' active' : ''}`}
@@ -1463,7 +1713,6 @@ export default function Document() {
               </button>
               {shareOpen && (
                 <div className="share-modal">
-                  {/* Link section */}
                   <div className="share-modal-section">
                     <p className="share-modal-heading">Share link</p>
                     <p className="share-modal-sub">Anyone with this link can view and edit</p>
@@ -1478,9 +1727,7 @@ export default function Document() {
                       </button>
                     </div>
                   </div>
-
-                  {/* Invite + access sections — owner only */}
-                  {docOwnerId === storedUser.id && (
+                  {docOwnerId === user?.id && (
                     <>
                       <div className="share-modal-divider" />
                       <div className="share-modal-section">
@@ -1497,7 +1744,7 @@ export default function Document() {
                         </div>
                         {(() => {
                           const inviteable = allUsers.filter(u =>
-                            u.id !== storedUser.id &&
+                            u.id !== user?.id &&
                             !docSharedWith.some(s => s.id === u.id) &&
                             u.name.toLowerCase().includes(shareSearch.toLowerCase())
                           )
@@ -1526,7 +1773,6 @@ export default function Document() {
                           )
                         })()}
                       </div>
-
                       {docSharedWith.length > 0 && (
                         <>
                           <div className="share-modal-divider" />
@@ -1668,9 +1914,19 @@ export default function Document() {
           items={slashItems_}
           selectedIndex={slashIdx}
           position={slashPos}
-          onSelect={(item) => {
-            suggestionPropsRef.current?.command(item)
-            setSlashOpen(false)
+          onSelect={(item: any) => {
+            if (item.isAI) {
+              // Capture text BEFORE deleteRange so we don't get a stale/empty read
+              const fullText = editor?.getText() ?? ''
+              const cursorPos = editor ? editor.state.doc.textBetween(0, editor.state.selection.from, '\n').length : 0
+              const range = suggestionPropsRef.current?.range
+              if (range) editor?.chain().focus().deleteRange(range).run()
+              setSlashOpen(false)
+              triggerAICommand(item.promptText || '', item.aiMode || 'write', { fullText, cursorOffset: cursorPos })
+            } else {
+              suggestionPropsRef.current?.command(item)
+              setSlashOpen(false)
+            }
           }}
         />
       )}
@@ -1686,6 +1942,13 @@ export default function Document() {
 
       {/* Cursor overlay: idle dimming + context preview */}
       {editor && <CursorOverlay editor={editor} provider={provider} />}
+
+      {/* AI error toast */}
+      {aiError && (
+        <div className="ai-error-toast" onClick={() => setAiError(null)}>
+          AI Error: {aiError}
+        </div>
+      )}
 
     </div>
   )

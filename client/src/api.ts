@@ -1,115 +1,228 @@
 const BASE = 'http://localhost:1234'
 
-export async function registerUser(user: {
+const OPTS: RequestInit = { credentials: 'include' }
+
+// ── Auth ─────────────────────────────────────────────────────────────
+
+export interface AuthUser {
   id: string
   name: string
+  email: string
   color: string
-}) {
+  avatar_url: string | null
+}
+
+export async function getMe(): Promise<AuthUser | null> {
   try {
-    await fetch(`${BASE}/users`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(user),
-    })
-  } catch (err) {
-    console.error('Failed to register user:', err)
+    const res = await fetch(`${BASE}/auth/me`, OPTS)
+    if (!res.ok) return null
+    return res.json()
+  } catch {
+    return null
   }
 }
 
-export async function getUserDocuments(userId: string) {
+export async function logout() {
   try {
-    const res = await fetch(`${BASE}/users/${userId}/documents`)
+    await fetch(`${BASE}/auth/logout`, { ...OPTS, method: 'POST' })
+  } catch {}
+}
+
+// ── Documents ────────────────────────────────────────────────────────
+
+export async function getUserDocuments() {
+  try {
+    const res = await fetch(`${BASE}/users/me/documents`, OPTS)
     if (!res.ok) return []
     return res.json()
-  } catch (err) {
-    console.error('Failed to get documents:', err)
+  } catch {
     return []
   }
 }
 
-export async function createDocument(room: string, ownerId: string) {
+export async function getSharedDocuments() {
+  try {
+    const res = await fetch(`${BASE}/users/me/shared-documents`, OPTS)
+    if (!res.ok) return []
+    return res.json()
+  } catch {
+    return []
+  }
+}
+
+export async function createDocument(room: string) {
   try {
     const res = await fetch(`${BASE}/documents`, {
+      ...OPTS,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ room, owner_id: ownerId }),
+      body: JSON.stringify({ room }),
     })
     return res.json()
-  } catch (err) {
-    console.error('Failed to create document:', err)
+  } catch {
     return null
   }
 }
 
-export async function deleteDocument(room: string, userId: string) {
+export async function deleteDocument(room: string) {
   try {
-    const res = await fetch(
-      `${BASE}/documents/${room}?user_id=${userId}`,
-      { method: 'DELETE' }
-    )
+    const res = await fetch(`${BASE}/documents/${room}`, { ...OPTS, method: 'DELETE' })
     return res.json()
-  } catch (err) {
-    console.error('Failed to delete document:', err)
+  } catch {
     return null
   }
 }
+
+export async function renameDocument(room: string, title: string) {
+  try {
+    const res = await fetch(`${BASE}/documents/${room}/title`, {
+      ...OPTS,
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    })
+    return res.json()
+  } catch {
+    return null
+  }
+}
+
+// ── Sharing ──────────────────────────────────────────────────────────
 
 export async function getAllUsers(): Promise<{ id: string; name: string; color: string }[]> {
   try {
-    const res = await fetch(`${BASE}/users`)
+    const res = await fetch(`${BASE}/users`, OPTS)
     if (!res.ok) return []
     return res.json()
-  } catch (err) {
-    console.error('Failed to get users:', err)
+  } catch {
     return []
   }
 }
 
 export async function getDocShares(room: string): Promise<{ id: string; name: string; color: string }[]> {
   try {
-    const res = await fetch(`${BASE}/documents/${room}/shares`)
+    const res = await fetch(`${BASE}/documents/${room}/shares`, OPTS)
     if (!res.ok) return []
     return res.json()
-  } catch (err) {
-    console.error('Failed to get doc shares:', err)
+  } catch {
     return []
   }
 }
 
-export async function shareDocument(room: string, ownerId: string, sharedWithId: string) {
+export async function shareDocument(room: string, sharedWithId: string) {
   try {
     const res = await fetch(`${BASE}/documents/${room}/share`, {
+      ...OPTS,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ owner_id: ownerId, shared_with_id: sharedWithId }),
+      body: JSON.stringify({ shared_with_id: sharedWithId }),
     })
     return res.json()
-  } catch (err) {
-    console.error('Failed to share document:', err)
+  } catch {
     return null
   }
 }
 
-export async function unshareDocument(room: string, ownerId: string, sharedWithId: string) {
+export async function unshareDocument(room: string, sharedWithId: string) {
   try {
-    const res = await fetch(
-      `${BASE}/documents/${room}/share/${sharedWithId}?owner_id=${ownerId}`,
-      { method: 'DELETE' }
-    )
+    const res = await fetch(`${BASE}/documents/${room}/share/${sharedWithId}`, { ...OPTS, method: 'DELETE' })
     return res.json()
-  } catch (err) {
-    console.error('Failed to unshare document:', err)
+  } catch {
     return null
   }
 }
 
-export async function getSharedDocuments(userId: string) {
+// ── Prefs ────────────────────────────────────────────────────────────
+
+export interface DocPrefs {
+  fullWidth?: boolean
+  spellCheck?: boolean
+  editorFont?: 'sans' | 'serif' | 'mono'
+  editorSize?: 'sm' | 'md' | 'lg'
+  editorLineHeight?: 'compact' | 'normal' | 'spacious'
+}
+
+export async function getDocPrefs(room: string): Promise<DocPrefs> {
   try {
-    const res = await fetch(`${BASE}/users/${userId}/shared-documents`)
-    if (!res.ok) return []
-    return res.json()
+    const res = await fetch(`${BASE}/documents/${room}/prefs`, OPTS)
+    if (!res.ok) return {}
+    const data = await res.json()
+    return data.prefs ?? {}
+  } catch {
+    return {}
+  }
+}
+
+export async function saveDocPrefs(room: string, prefs: DocPrefs) {
+  try {
+    await fetch(`${BASE}/documents/${room}/prefs`, {
+      ...OPTS,
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefs }),
+    })
+  } catch {}
+}
+
+// ── Real-time events (SSE) ───────────────────────────────────────────
+
+export type ServerEvent =
+  | { type: 'doc:shared';   payload: Record<string, unknown> }
+  | { type: 'doc:unshared'; payload: { room: string } }
+  | { type: 'doc:deleted';  payload: { room: string } }
+
+export function connectEvents(onEvent: (e: ServerEvent) => void): () => void {
+  const es = new EventSource(`${BASE}/events`, { withCredentials: true })
+
+  es.addEventListener('doc:shared',   e => onEvent({ type: 'doc:shared',   payload: JSON.parse((e as MessageEvent).data) }))
+  es.addEventListener('doc:unshared', e => onEvent({ type: 'doc:unshared', payload: JSON.parse((e as MessageEvent).data) }))
+  es.addEventListener('doc:deleted',  e => onEvent({ type: 'doc:deleted',  payload: JSON.parse((e as MessageEvent).data) }))
+
+  return () => es.close()
+}
+
+// ── AI ───────────────────────────────────────────────────────────────
+
+export async function streamAIContent(
+  room: string,
+  prompt: string,
+  before: string,
+  after: string,
+  mode: 'write' | 'continue' | 'summarize' | 'rewrite',
+  onToken: (token: string) => void,
+  onDone: () => void,
+  onError: (err: Error) => void,
+): Promise<void> {
+  try {
+    const res = await fetch(`${BASE}/documents/${room}/ai`, {
+      ...OPTS,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, before, after, mode }),
+    })
+    if (!res.ok) throw new Error(`AI request failed: ${res.status}`)
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6)
+        if (data === '[DONE]') { onDone(); return }
+        try {
+          const parsed = JSON.parse(data)
+          if (parsed.error) { onError(new Error(parsed.error)); return }
+          onToken(parsed.token)
+        } catch {}
+      }
+    }
+    onDone()
   } catch (err) {
-    console.error('Failed to get shared documents:', err)
-    return []
+    onError(err as Error)
   }
 }
