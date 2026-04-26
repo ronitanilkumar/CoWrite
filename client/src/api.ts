@@ -170,6 +170,8 @@ export type ServerEvent =
   | { type: 'doc:shared';   payload: Record<string, unknown> }
   | { type: 'doc:unshared'; payload: { room: string } }
   | { type: 'doc:deleted';  payload: { room: string } }
+  | { type: 'job:complete'; payload: { job_id: string; room: string; status: string; preview: string } }
+  | { type: 'job:failed';   payload: { job_id: string; room: string; error: string } }
 
 export function connectEvents(onEvent: (e: ServerEvent) => void): () => void {
   const es = new EventSource(`${BASE}/events`, { withCredentials: true })
@@ -177,9 +179,59 @@ export function connectEvents(onEvent: (e: ServerEvent) => void): () => void {
   es.addEventListener('doc:shared',   e => onEvent({ type: 'doc:shared',   payload: JSON.parse((e as MessageEvent).data) }))
   es.addEventListener('doc:unshared', e => onEvent({ type: 'doc:unshared', payload: JSON.parse((e as MessageEvent).data) }))
   es.addEventListener('doc:deleted',  e => onEvent({ type: 'doc:deleted',  payload: JSON.parse((e as MessageEvent).data) }))
+  es.addEventListener('job:complete', e => onEvent({ type: 'job:complete', payload: JSON.parse((e as MessageEvent).data) }))
+  es.addEventListener('job:failed',   e => onEvent({ type: 'job:failed',   payload: JSON.parse((e as MessageEvent).data) }))
 
   return () => es.close()
 }
+
+// ── Agent jobs ───────────────────────────────────────────────────────
+
+export async function submitAgentJob(params: {
+  room: string
+  task: string
+  mode: string
+  effort: string
+}): Promise<{ job_id: string; status: string }> {
+  const res = await fetch(`${BASE}/agent-job`, {
+    ...OPTS,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task: params.task, document_id: params.room, mode: params.mode, effort: params.effort }),
+  })
+  if (!res.ok) throw new Error(`Failed to submit agent job: ${res.status}`)
+  return res.json()
+}
+
+export interface AgentJobResult {
+  id: string
+  current_state: string
+  result: string | null
+  error_msg: string | null
+  mode: string
+  task: string
+  model_used: string
+  output_tokens: number
+  created_at: number
+}
+
+export async function getJobResult(jobId: string): Promise<AgentJobResult> {
+  const res = await fetch(`${BASE}/jobs/${jobId}`, OPTS)
+  if (!res.ok) throw new Error(`Failed to fetch job: ${res.status}`)
+  return res.json()
+}
+
+export async function getJobsForRoom(room: string): Promise<AgentJobResult[]> {
+  try {
+    const res = await fetch(`${BASE}/jobs?room=${encodeURIComponent(room)}`, OPTS)
+    if (!res.ok) return []
+    return res.json()
+  } catch {
+    return []
+  }
+}
+
+export const getDocumentJobs = getJobsForRoom
 
 // ── AI ───────────────────────────────────────────────────────────────
 

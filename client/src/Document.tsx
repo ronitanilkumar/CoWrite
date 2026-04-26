@@ -19,17 +19,18 @@ import { WebsocketProvider } from 'y-websocket'
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from './AuthContext'
-import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, type DocPrefs } from './api'
+import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, getJobResult, getDocumentJobs, submitAgentJob, type AgentJobResult, type DocPrefs } from './api'
 import { createPortal } from 'react-dom'
+import { marked } from 'marked'
 import {
   Heading1, Heading2, Heading3, List, ListOrdered,
   ListTodo, Quote, Code, Code2, Minus, Table2,
-  AlignJustify, Settings, FileText,
+  Settings,
   AlignLeft, CalendarDays, Clock,
   Bold, Italic, Strikethrough,
   Copy, Check, ChevronDown,
   GripVertical, Trash2, CopyPlus, Plus,
-  ArrowLeft, Share2, Link, Search,
+  ArrowLeft, ArrowUp, Share2, Link, Search, Sparkles, X, Gauge,
 } from 'lucide-react'
 import './App.css'
 
@@ -1080,6 +1081,456 @@ function CursorOverlay({ editor, provider }: { editor: any; provider: any }) {
   )
 }
 
+// ── Agent Panel ──────────────────────────────────────────────────────
+
+
+type PanelMode = 'hidden' | 'side' | 'full'
+
+type AgentTaskMode = 'auto' | 'review' | 'expand' | 'proofread' | 'summarize'
+type AgentEffortMode = 'auto' | 'low' | 'balanced' | 'high' | 'extra-high'
+
+interface DropdownOption<T extends string> {
+  value: T
+  label: string
+  description: string
+  icon: (props: { size?: number; strokeWidth?: number; className?: string }) => JSX.Element | null
+  modeColor?: string
+}
+
+const PANEL_TASK_OPTIONS: Array<DropdownOption<AgentTaskMode>> = [
+  { value: 'auto',      label: 'Auto',      description: 'Infer the job from the instruction.',     icon: Sparkles, modeColor: 'var(--agent-mode-auto-text)' },
+  { value: 'review',    label: 'Review',    description: 'Find clarity, logic, and structure issues.', icon: Sparkles, modeColor: 'var(--agent-mode-review-text)' },
+  { value: 'expand',    label: 'Expand',    description: 'Add depth, examples, or explanation.',    icon: Sparkles, modeColor: 'var(--agent-mode-expand-text)' },
+  { value: 'proofread', label: 'Proofread', description: 'Catch grammar and punctuation issues.',   icon: Sparkles, modeColor: 'var(--agent-mode-proofread-text)' },
+  { value: 'summarize', label: 'Summarize', description: 'Create a concise standalone summary.',    icon: Sparkles, modeColor: 'var(--agent-mode-summarize-text)' },
+]
+
+const PANEL_EFFORT_OPTIONS: Array<DropdownOption<AgentEffortMode>> = [
+  { value: 'auto', label: 'Auto', description: 'Route model choice from the request.', icon: Gauge },
+  { value: 'low', label: 'Low', description: 'Prefer speed over depth.', icon: Gauge },
+  { value: 'balanced', label: 'Balanced', description: 'Default quality and speed tradeoff.', icon: Gauge },
+  { value: 'high', label: 'High', description: 'Spend more effort on harder prompts.', icon: Gauge },
+  { value: 'extra-high', label: 'Extra High', description: 'Use the deepest pass for demanding work.', icon: Gauge },
+]
+
+function PanelInlineDropdown<T extends string>({
+  label, value, options, open, onToggle, onSelect,
+}: {
+  label: string
+  value: T
+  options: Array<DropdownOption<T>>
+  open: boolean
+  onToggle: () => void
+  onSelect: (v: T) => void
+}) {
+  const selected = options.find(o => o.value === value) ?? options[0]
+  const Icon = selected.icon
+  return (
+    <div className="agent-dropdown" data-agent-dropdown-root="true">
+      <button
+        type="button"
+        className={`agent-dropdown-trigger${open ? ' open' : ''}`}
+        onClick={onToggle}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={label}
+      >
+        <Icon size={14} strokeWidth={2} className="agent-dropdown-trigger-icon" />
+        <span>{selected.label}</span>
+        <ChevronDown size={14} strokeWidth={2.2} className="agent-dropdown-trigger-chevron" />
+      </button>
+      {open && (
+        <div className="agent-dropdown-menu agent-dropdown-menu--up" role="menu">
+          {options.map(opt => (
+            <button
+              key={opt.value}
+              className={`agent-dropdown-item${opt.value === value ? ' selected' : ''}`}
+              role="menuitem"
+              onClick={() => { onSelect(opt.value); onToggle() }}
+            >
+              {opt.modeColor && (
+                <span className="agent-dropdown-item-swatch" style={{ background: opt.modeColor }} />
+              )}
+              <div className="agent-dropdown-item-text">
+                <span className="agent-dropdown-item-label">{opt.label}</span>
+                <span className="agent-dropdown-item-desc">{opt.description}</span>
+              </div>
+              {opt.value === value && <Check size={13} strokeWidth={2.5} className="agent-dropdown-item-check" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface AgentTurn {
+  role: 'user' | 'agent'
+  task?: string
+  mode?: string
+  effort?: string
+  timestamp: number
+  jobId?: string
+  state?: string
+  result?: string | null
+  error?: string | null
+}
+
+interface AgentPanelProps {
+  roomId: string
+  editor: ReturnType<typeof useEditor>
+  panelMode: PanelMode
+  onPanelModeChange: (m: PanelMode) => void
+  onUnseenChange: (n: number) => void
+  incomingJob: { job_id: string; type: 'complete' | 'failed'; error?: string } | null
+  onIncomingJobConsumed: () => void
+}
+
+function AgentPanel({
+  roomId, editor, panelMode, onPanelModeChange, onUnseenChange,
+  incomingJob, onIncomingJobConsumed,
+}: AgentPanelProps) {
+  const [turns, setTurns] = useState<AgentTurn[]>([])
+  const [seenTurnIds, setSeenTurnIds] = useState<Set<string>>(new Set())
+  const [composerPrompt, setComposerPrompt] = useState('')
+  const [composerMode, setComposerMode] = useState<AgentTaskMode>('auto')
+  const [composerEffort, setComposerEffort] = useState<AgentEffortMode>('auto')
+  const [openDropdown, setOpenDropdown] = useState<'mode' | 'effort' | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [panelError, setPanelError] = useState<string | null>(null)
+  const [confirmReplaceJobId, setConfirmReplaceJobId] = useState<string | null>(null)
+  const [copiedJobId, setCopiedJobId] = useState<string | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
+
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight
+    })
+  }, [])
+
+  // Load history on mount — build turns from completed jobs
+  useEffect(() => {
+    getDocumentJobs(roomId).then(jobs => {
+      const sorted = [...jobs].sort((a, b) => a.created_at - b.created_at)
+      const newTurns: AgentTurn[] = []
+      for (const job of sorted) {
+        newTurns.push({ role: 'user', task: job.task, mode: job.mode, effort: job.model_used, timestamp: job.created_at, jobId: job.id })
+        newTurns.push({ role: 'agent', jobId: job.id, state: job.current_state, result: job.result, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode })
+      }
+      setTurns(newTurns)
+      scrollToBottom()
+    })
+  }, [roomId])
+
+  // Track unseen agent turns
+  useEffect(() => {
+    const unseen = turns.filter(t => t.role === 'agent' && t.jobId && !seenTurnIds.has(t.jobId) && (t.state === 'done' || t.state === 'failed')).length
+    onUnseenChange(unseen)
+  }, [turns, seenTurnIds])
+
+  // Mark all as seen when panel opens
+  useEffect(() => {
+    if (panelMode !== 'hidden') {
+      setSeenTurnIds(prev => {
+        const next = new Set(prev)
+        turns.forEach(t => { if (t.jobId) next.add(t.jobId) })
+        return next
+      })
+    }
+  }, [panelMode])
+
+  // React to incoming SSE job events relayed from parent
+  useEffect(() => {
+    if (!incomingJob) return
+    onIncomingJobConsumed()
+    if (incomingJob.type === 'complete') {
+      getJobResult(incomingJob.job_id).then(job => {
+        setTurns(prev => {
+          // update existing pending agent turn for this job, or append
+          const idx = prev.findIndex(t => t.role === 'agent' && t.jobId === job.id)
+          if (idx !== -1) {
+            const next = [...prev]
+            next[idx] = { ...next[idx], state: job.current_state, result: job.result, error: job.error_msg }
+            return next
+          }
+          return [...prev,
+            { role: 'user', task: job.task, mode: job.mode, timestamp: job.created_at, jobId: job.id },
+            { role: 'agent', jobId: job.id, state: job.current_state, result: job.result, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode },
+          ]
+        })
+        setSubmitting(false)
+        onPanelModeChange('side')
+        scrollToBottom()
+      }).catch(() => {
+        setSubmitting(false)
+        setPanelError('Failed to fetch job result.')
+        setTimeout(() => setPanelError(null), 4000)
+      })
+    } else {
+      setTurns(prev => {
+        const idx = prev.findIndex(t => t.role === 'agent' && t.jobId === incomingJob.job_id)
+        if (idx !== -1) {
+          const next = [...prev]
+          next[idx] = { ...next[idx], state: 'failed', error: incomingJob.error ?? 'Agent job failed.' }
+          return next
+        }
+        return prev
+      })
+      setSubmitting(false)
+      scrollToBottom()
+    }
+  }, [incomingJob])
+
+  // Auto-resize textarea
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 120) + 'px'
+  }, [composerPrompt])
+
+  const handleSubmit = async () => {
+    const task = composerPrompt.trim()
+    if (!task || submitting) return
+    setComposerPrompt('')
+    setSubmitting(true)
+    const now = Date.now()
+    const tempId = `pending-${now}`
+    setTurns(prev => [
+      ...prev,
+      { role: 'user', task, mode: composerMode, effort: composerEffort, timestamp: now, jobId: tempId },
+      { role: 'agent', jobId: tempId, state: 'pending', result: null, error: null, timestamp: now + 1, mode: composerMode },
+    ])
+    scrollToBottom()
+    try {
+      const { job_id } = await submitAgentJob({ room: roomId, task, mode: composerMode, effort: composerEffort })
+      setTurns(prev => prev.map(t => t.jobId === tempId ? { ...t, jobId: job_id } : t))
+    } catch {
+      setTurns(prev => prev.map(t =>
+        t.jobId === tempId && t.role === 'agent' ? { ...t, state: 'failed', error: 'Failed to submit job.' } : t
+      ))
+      setSubmitting(false)
+    }
+  }
+
+  const handleInsertAtEnd = (result: string) => {
+    if (!editor) return
+    const endPos = editor.state.doc.content.size
+    const paragraphs = result.split(/\n{2,}/).filter(p => p.trim())
+    const content = paragraphs.map(p => {
+      const lines = p.split('\n')
+      const nodes: any[] = []
+      lines.forEach((line, i) => {
+        if (line) nodes.push({ type: 'text', text: line })
+        if (i < lines.length - 1) nodes.push({ type: 'hardBreak' })
+      })
+      return { type: 'paragraph', content: nodes }
+    })
+    editor.chain().focus().insertContentAt(endPos, content).run()
+  }
+
+  const handleReplaceDocument = (result: string) => {
+    if (!editor) return
+    editor.commands.setContent(result)
+    setConfirmReplaceJobId(null)
+  }
+
+  const handleCopy = (result: string, jobId: string) => {
+    navigator.clipboard.writeText(result).then(() => {
+      setCopiedJobId(jobId)
+      setTimeout(() => setCopiedJobId(null), 1800)
+    })
+  }
+
+  const hasRunning = turns.some(t => t.role === 'agent' && (t.state === 'pending' || t.state === 'running'))
+
+  return (
+    <>
+      <div className={`agent-panel agent-panel--${panelMode}`} aria-hidden={panelMode === 'hidden'}>
+        {/* Header */}
+        <div className="agent-panel-header">
+          <div className="agent-panel-header-left">
+            <span className="agent-panel-header-title">CoWrite Agent</span>
+          </div>
+          <div className="agent-panel-header-right">
+            <button
+              className="agent-panel-icon-btn"
+              onClick={() => onPanelModeChange(panelMode === 'full' ? 'side' : 'full')}
+              title={panelMode === 'full' ? 'Collapse' : 'Expand'}
+            >
+              {panelMode === 'full' ? (
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+              ) : (
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+              )}
+            </button>
+            <button
+              className="agent-panel-icon-btn"
+              onClick={() => onPanelModeChange('hidden')}
+              title="Close"
+            >
+              <X size={14} strokeWidth={2} />
+            </button>
+          </div>
+        </div>
+
+        {/* Thread body */}
+        <div className="agent-panel-body" ref={bodyRef}>
+          {turns.length === 0 && (
+            <div className="agent-panel-empty">
+              Ask the agent to write, edit, summarize, or review this document.
+            </div>
+          )}
+          {turns.map((turn, i) => {
+            if (turn.role === 'user') {
+              return (
+                <div key={i} className="agent-turn agent-turn--user">
+                  <div className="agent-turn-bubble">
+                    <span className="agent-turn-task">{turn.task}</span>
+                    <div className="agent-turn-meta">
+                      <span
+                        className={`agent-turn-mode-bar agent-turn-mode-bar--${turn.mode ?? 'auto'}`}
+                        title={(turn.mode ?? 'auto').charAt(0).toUpperCase() + (turn.mode ?? 'auto').slice(1)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )
+            }
+            // agent turn
+            const isThinking = turn.state === 'pending' || turn.state === 'running'
+            const isFailed = turn.state === 'failed'
+            const isDone = turn.state === 'done'
+            const result = turn.result ?? ''
+            const htmlResult = isDone ? marked(result) as string : ''
+            const isConfirmingReplace = confirmReplaceJobId === turn.jobId
+            return (
+              <div key={i} className="agent-turn agent-turn--agent">
+                {isThinking && (
+                  <div className="agent-typing-indicator">
+                    <span /><span /><span />
+                  </div>
+                )}
+                {isFailed && (
+                  <div className="agent-turn-error">
+                    {turn.error || 'Agent job failed.'}
+                  </div>
+                )}
+                {isDone && (
+                  <>
+                    <div
+                      className="agent-result-prose"
+                      dangerouslySetInnerHTML={{ __html: htmlResult }}
+                    />
+                    <div className="agent-turn-actions">
+                      <button
+                        className="agent-turn-action-btn"
+                        onClick={() => handleCopy(result, turn.jobId!)}
+                        title="Copy"
+                      >
+                        {copiedJobId === turn.jobId ? <Check size={12} strokeWidth={2.5} /> : <Copy size={12} strokeWidth={2} />}
+                        {copiedJobId === turn.jobId ? 'Copied' : 'Copy'}
+                      </button>
+                      {(turn.mode === 'expand' || turn.mode === 'auto') && (
+                        <button
+                          className="agent-turn-action-btn agent-turn-action-btn--primary"
+                          onClick={() => handleInsertAtEnd(result)}
+                          title="Insert at end of document"
+                        >
+                          Insert at end
+                        </button>
+                      )}
+                      {turn.mode === 'proofread' && (
+                        isConfirmingReplace ? (
+                          <>
+                            <span className="agent-turn-confirm-text">Replace all document content?</span>
+                            <button
+                              className="agent-turn-action-btn agent-turn-action-btn--danger"
+                              onClick={() => handleReplaceDocument(result)}
+                            >
+                              Replace
+                            </button>
+                            <button
+                              className="agent-turn-action-btn"
+                              onClick={() => setConfirmReplaceJobId(null)}
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            className="agent-turn-action-btn agent-turn-action-btn--primary"
+                            onClick={() => setConfirmReplaceJobId(turn.jobId!)}
+                          >
+                            Replace document
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )
+          })}
+        </div>
+
+        {/* Composer footer */}
+        <div className="agent-composer" onClick={() => setOpenDropdown(null)}>
+          <div className="agent-composer-card" onClick={e => e.stopPropagation()}>
+            <textarea
+              ref={textareaRef}
+              className="agent-composer-textarea"
+              placeholder="Ask the agent…"
+              value={composerPrompt}
+              onChange={e => setComposerPrompt(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit() }
+              }}
+              rows={1}
+              disabled={submitting}
+            />
+            <div className="agent-composer-toolbar">
+              <div className="agent-composer-dropdowns">
+                <PanelInlineDropdown
+                  label="Mode"
+                  value={composerMode}
+                  options={PANEL_TASK_OPTIONS}
+                  open={openDropdown === 'mode'}
+                  onToggle={() => setOpenDropdown(d => d === 'mode' ? null : 'mode')}
+                  onSelect={v => setComposerMode(v)}
+                />
+                <PanelInlineDropdown
+                  label="Effort"
+                  value={composerEffort}
+                  options={PANEL_EFFORT_OPTIONS}
+                  open={openDropdown === 'effort'}
+                  onToggle={() => setOpenDropdown(d => d === 'effort' ? null : 'effort')}
+                  onSelect={v => setComposerEffort(v)}
+                />
+              </div>
+              <button
+                className="agent-composer-send"
+                onClick={handleSubmit}
+                disabled={!composerPrompt.trim() || submitting || hasRunning}
+                title="Send"
+              >
+                <ArrowUp size={14} strokeWidth={2.5} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {panelError && (
+        <div className="ai-error-toast" onClick={() => setPanelError(null)}>
+          {panelError}
+        </div>
+      )}
+    </>
+  )
+}
+
 // ── App ──────────────────────────────────────────────────────────────
 export default function Document() {
   const { user } = useAuth()
@@ -1100,7 +1551,7 @@ export default function Document() {
   }, [roomId])
 
   const [onlineUsers, setOnlineUsers] = useState<AwarenessUser[]>([])
-  const [connected, setConnected] = useState(false)
+
   const [contentReady, setContentReady] = useState(false)
   const [docTitle, setDocTitle] = useState(() => yTitle.toString() || '')
   const [theme, setTheme] = useState<'dark' | 'light' | 'system'>(() => {
@@ -1113,7 +1564,6 @@ export default function Document() {
   })
   const userName = user?.name ?? ''
 
-  const [sidebarOpen, setSidebarOpen] = useState(true)
   const [words, setWords] = useState(0)
   const [inTable, setInTable] = useState(false)
 
@@ -1175,6 +1625,10 @@ export default function Document() {
   const [aiStreaming, setAiStreaming] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
   const aiInsertPosRef = useRef<number>(0)
+
+  const [incomingJob, setIncomingJob] = useState<{ job_id: string; type: 'complete' | 'failed'; error?: string } | null>(null)
+  const [agentPanelMode, setAgentPanelMode] = useState<PanelMode>('hidden')
+  const [agentUnseenCount, setAgentUnseenCount] = useState(0)
 
   useEffect(() => {
     if (!shareOpen) return
@@ -1450,8 +1904,6 @@ export default function Document() {
 
     provider.awareness.setLocalStateField('user', currentUser)
     provider.awareness.setLocalStateField('lastActive', Date.now())
-    const statusHandler = (event: { status: string }) => setConnected(event.status === 'connected')
-    provider.on('status', statusHandler)
 
     // Kicked when access is revoked — server closes WS with code 4403
     provider.on('connection-close', (event: CloseEvent | null) => {
@@ -1504,15 +1956,18 @@ export default function Document() {
     }
     yTitle.observe(updateTitle)
 
-    // Navigate home if the doc is deleted while we're editing
+    // Navigate home if deleted; relay job events to AgentTray
     const disconnectSSE = connectEvents(e => {
       if (e.type === 'doc:deleted' && e.payload.room === roomId) navigate('/')
+      if (e.type === 'job:complete' && e.payload.room === roomId)
+        setIncomingJob({ job_id: e.payload.job_id, type: 'complete' })
+      if (e.type === 'job:failed' && e.payload.room === roomId)
+        setIncomingJob({ job_id: e.payload.job_id, type: 'failed', error: e.payload.error })
     })
 
     return () => {
       disconnectSSE()
       provider.awareness.off('change', updateUsers)
-      provider.off('status', statusHandler)
       provider.off('sync', syncHandler)
       document.removeEventListener('keydown', markActive)
       document.removeEventListener('mousemove', markActive)
@@ -1543,67 +1998,6 @@ export default function Document() {
 
   return (
     <div className="app">
-      {/* Sidebar */}
-      <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
-        <div className="sidebar-inner">
-          <div className="sidebar-header">
-            <div className="sidebar-logo">
-              <img
-                src={resolvedTheme === 'dark' ? '/cowrite_darkmode.svg' : '/cowrite_lightmode.svg'}
-                alt="CoWrite"
-                className="sidebar-logo-img"
-              />
-            </div>
-            <div className="sidebar-header-actions">
-              <button className="sidebar-close" onClick={() => setSidebarOpen(false)} title="Close sidebar">
-                <AlignJustify size={16} strokeWidth={2} />
-              </button>
-            </div>
-          </div>
-
-          <div className="sidebar-doc-title">
-            <FileText size={14} />
-            <span>{docTitle || 'Untitled'}</span>
-          </div>
-
-          <div className="sidebar-section-header">
-            <span className="sidebar-section-title">Collaborators</span>
-            <span className="sidebar-section-count">{onlineUsers.length}</span>
-          </div>
-
-          <div className="user-list">
-            {onlineUsers.map((user, i) => (
-              <div className={`user-item ${user.status === 'idle' ? 'idle' : ''}`} key={i}>
-                <div className="user-avatar" style={{ background: user.color }}>
-                  {user.name[0]}
-                  <span className={`user-status-ring ${user.status}`} />
-                </div>
-                <div className="user-info">
-                  <span className="user-name">
-                    {user.name}
-                    {user.isYou && <span className="you-badge">You</span>}
-                  </span>
-                  <span className="user-location">{cursorLabel(editor, user.anchor)}</span>
-                </div>
-                {user.status === 'idle' && !user.isYou && (
-                  <span className="user-meta">{timeAgo(Date.now() - (user.lastActive ?? Date.now()))}</span>
-                )}
-              </div>
-            ))}
-          </div>
-
-          <div className="sidebar-spacer" />
-
-          <div className="sidebar-bottom">
-            <div className="sidebar-divider" />
-            <div className="sidebar-connection">
-              <span className={`sidebar-connection-dot ${connected ? 'connected' : 'disconnected'}`} />
-              <span>{connected ? 'Connected' : 'Reconnecting…'}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
       {/* Main */}
       <div className="main">
         {/* Topbar */}
@@ -1614,20 +2008,9 @@ export default function Document() {
               className="topbar-menu-btn"
               onClick={() => navigate('/')}
               title="Back to documents"
-              style={{ marginRight: 4 }}
             >
               <ArrowLeft size={16} strokeWidth={2} />
             </button>
-            {!sidebarOpen && (
-              <>
-                <img
-                  src={resolvedTheme === 'dark' ? '/cowrite_darkmode.svg' : '/cowrite_lightmode.svg'}
-                  alt="CoWrite"
-                  className="topbar-logo-img"
-                />
-                <div className="topbar-logo-divider" />
-              </>
-            )}
             <div className="topbar-title-wrapper">
               <span className="topbar-title-sizer">{docTitle || 'Untitled'}</span>
               <input
@@ -1812,6 +2195,15 @@ export default function Document() {
                 <span className="topbar-stat-num">{readingTime(words)}</span>
               </div>
             )}
+            <div className="topbar-sep" />
+            <button
+              className={`topbar-share-btn agent-topbar-btn${agentUnseenCount > 0 ? ' has-results' : ''}${agentPanelMode !== 'hidden' ? ' active' : ''}`}
+              onClick={() => setAgentPanelMode(m => m === 'hidden' ? 'side' : 'hidden')}
+              title="Agent"
+            >
+              CoWrite Agent
+              <span className="agent-topbar-btn-dot" />
+            </button>
             <div className="settings-wrap" ref={settingsRef}>
               <button className="topbar-menu-btn" onClick={() => setSettingsOpen(o => !o)} title="Settings">
                 <Settings size={16} strokeWidth={2} />
@@ -1876,14 +2268,11 @@ export default function Document() {
                 </div>
               )}
             </div>
-            <button className="topbar-menu-btn" onClick={() => setSidebarOpen(o => !o)} title="Toggle sidebar">
-              <AlignJustify size={16} strokeWidth={2} />
-            </button>
           </div>
         </div>
 
         {/* Editor */}
-        <div className="editor-container">
+        <div className={`editor-container${agentPanelMode === 'side' ? ' panel-open' : ''}`}>
           <div className={`editor-inner${fullWidth ? ' full-width' : ''}`}>
             <input
               className="doc-title-input"
@@ -1942,6 +2331,19 @@ export default function Document() {
 
       {/* Cursor overlay: idle dimming + context preview */}
       {editor && <CursorOverlay editor={editor} provider={provider} />}
+
+      {/* Agent panel */}
+      {editor && roomId && (
+        <AgentPanel
+          roomId={roomId}
+          editor={editor}
+          panelMode={agentPanelMode}
+          onPanelModeChange={setAgentPanelMode}
+          onUnseenChange={setAgentUnseenCount}
+          incomingJob={incomingJob}
+          onIncomingJobConsumed={() => setIncomingJob(null)}
+        />
+      )}
 
       {/* AI error toast */}
       {aiError && (

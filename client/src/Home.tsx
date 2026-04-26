@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from './AuthContext'
-import { logout, getUserDocuments, createDocument, deleteDocument, getSharedDocuments, renameDocument, connectEvents, type ServerEvent } from './api'
+import { logout, getUserDocuments, createDocument, deleteDocument, getSharedDocuments, renameDocument, connectEvents, submitAgentJob, type ServerEvent } from './api'
 import { FilePlus, ArrowRight, ArrowUp, Check, ChevronDown, Gauge, Plus, FileText, Search, Sparkles, Trash2, Pencil, Code2, Table2, ListChecks, LogOut, type LucideIcon } from 'lucide-react'
 import './Home.css'
 
@@ -125,18 +125,6 @@ function filterDocs(docs: Doc[], query: string): Doc[] {
   })
 }
 
-function getAgentTaskLabel(task: Exclude<AgentTaskMode, 'auto'>): string {
-  switch (task) {
-    case 'review':
-      return 'Review'
-    case 'expand':
-      return 'Expand'
-    case 'proofread':
-      return 'Proofread'
-    case 'summarize':
-      return 'Summarize'
-  }
-}
 
 function inferAgentTask(prompt: string): Exclude<AgentTaskMode, 'auto'> {
   const lower = prompt.toLowerCase()
@@ -150,26 +138,6 @@ function resolveAgentTask(task: AgentTaskMode, prompt: string): Exclude<AgentTas
   return task === 'auto' ? inferAgentTask(prompt) : task
 }
 
-function resolveAgentModelLabel(
-  effort: AgentEffortMode,
-  task: Exclude<AgentTaskMode, 'auto'>,
-  prompt: string
-): string {
-  const lower = prompt.toLowerCase()
-  switch (effort) {
-    case 'low':
-      return task === 'proofread' || task === 'summarize' ? 'Claude Haiku' : 'Claude Sonnet'
-    case 'balanced':
-      return 'Claude Sonnet'
-    case 'high':
-    case 'extra-high':
-      return 'Claude Opus'
-    case 'auto':
-      if (task === 'proofread' || task === 'summarize') return 'Claude Haiku'
-      if (/(deep|thorough|critique|logic|argument|strategy|analy[sz]e|recruiter)/.test(lower)) return 'Claude Opus'
-      return 'Claude Sonnet'
-  }
-}
 
 function InlineDropdown<T extends string>({
   label,
@@ -447,7 +415,6 @@ export default function Home() {
       icon: FileText,
     }]
   const resolvedAgentTask = resolveAgentTask(agentTask, agentPrompt)
-  const resolvedModelLabel = resolveAgentModelLabel(agentEffort, resolvedAgentTask, agentPrompt)
   const canSubmitAgent = !!selectedComposerDoc && agentPrompt.trim().length > 0
 
   useEffect(() => {
@@ -481,6 +448,10 @@ export default function Home() {
         setSharedDocs(prev => prev.filter(d => d.room !== e.payload.room))
       } else if (e.type === 'doc:deleted') {
         setSharedDocs(prev => prev.filter(d => d.room !== e.payload.room))
+      } else if (e.type === 'job:complete') {
+        setAgentComposerStatus('Agent finished — open the document to review the result.')
+      } else if (e.type === 'job:failed') {
+        setAgentComposerStatus('Agent job failed. Try again.')
       }
     })
   }, [])
@@ -599,12 +570,21 @@ export default function Home() {
     await renameDocument(room, newTitle)
   }
 
-  const handleAgentComposerSubmit = () => {
+  const handleAgentComposerSubmit = async () => {
     if (!selectedComposerDoc || !agentPrompt.trim()) return
-
-    setAgentComposerStatus(
-      `${getAgentTaskLabel(resolvedAgentTask)} queued locally for ${selectedComposerDoc.title || 'Untitled'} with ${resolvedModelLabel}.`
-    )
+    const task = agentPrompt.trim()
+    setAgentPrompt('')
+    try {
+      await submitAgentJob({
+        room: selectedAgentRoom,
+        task,
+        mode: resolvedAgentTask,
+        effort: agentEffort,
+      })
+      setAgentComposerStatus('Agent job queued — you\'ll be notified when it\'s done.')
+    } catch {
+      setAgentComposerStatus('Failed to queue agent job. Try again.')
+    }
   }
 
   const logoSrc = resolvedTheme === 'light' ? '/cowrite_lightmode.svg' : '/cowrite_darkmode.svg'

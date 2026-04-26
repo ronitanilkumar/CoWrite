@@ -37,7 +37,6 @@ db.exec(`
   )
 `)
 
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -80,6 +79,27 @@ db.exec(`
   )
 `)
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS agent_jobs (
+    id            TEXT PRIMARY KEY,
+    task          TEXT,
+    owner         TEXT NOT NULL REFERENCES users(id),
+    current_state TEXT DEFAULT 'pending',
+    created_at    INTEGER NOT NULL,
+    timeout_at    INTEGER,
+    document_id   TEXT NOT NULL REFERENCES documents(room) ON DELETE CASCADE,
+    mode          TEXT,
+    effort        TEXT,
+    result        TEXT,
+    attempt       INTEGER DEFAULT 0,
+    max_retries   INTEGER DEFAULT 2,
+    started_at    INTEGER,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    model_used    TEXT,
+    error_msg    TEXT
+  )
+`)
 
 console.log('Database ready')
 
@@ -204,6 +224,37 @@ const getSharedDocs = db.prepare(`
   ORDER BY d.updated_at DESC
 `)
 
+const getAccessibleDoc = db.prepare(`
+  SELECT d.room, d.owner_id
+  FROM documents d
+  WHERE d.room = ?
+    AND (
+      d.owner_id = ?
+      OR EXISTS (
+        SELECT 1
+        FROM document_shares s
+        WHERE s.document_id = d.room
+          AND s.shared_with = ?
+      )
+    )
+`)
+
+const createAgentJob = db.prepare(`
+  INSERT INTO agent_jobs (id, task, owner, current_state, created_at, timeout_at, document_id, mode, effort, attempt, max_retries, started_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`)
+
+const claimAgentJob = db.prepare(`
+  UPDATE agent_jobs
+  SET current_state = 'running', attempt = attempt + 1, started_at = ?
+  WHERE id = (
+    SELECT id FROM agent_jobs
+    WHERE current_state = 'pending' OR (current_state = 'failed' AND attempt < max_retries) OR (current_state = 'running' AND timeout_at < ?)
+    ORDER BY created_at ASC
+    LIMIT 1
+  )
+`)
+
 function normalizePreviewText(text = '') {
   return text.replace(/\s+/g, ' ').trim().slice(0, PREVIEW_TEXT_LIMIT)
 }
@@ -325,60 +376,60 @@ function backfillDocumentPreviews() {
 }
 
 function saveDocument(roomName) {
-    try {
-        const ydoc = getYDoc(roomName)
-        if (!ydoc) {
-            console.warn(`saveDocument: no ydoc found for room ${roomName}`)
-            return
-        }
-        const state = Y.encodeStateAsUpdate(ydoc)
-        const title = ydoc.getText('title').toString() || 'Untitled'
-        const preview = JSON.stringify(extractPreviewBlocks(ydoc))
-        upsertDoc.run(roomName, state, Date.now(), title, preview)
-        console.log(`Saved: ${roomName}`)
-    } catch (err) {
-        console.error(`Failed to save document ${roomName}:`, err)
+  try {
+    const ydoc = getYDoc(roomName)
+    if (!ydoc) {
+      console.warn(`saveDocument: no ydoc found for room ${roomName}`)
+      return
     }
+    const state = Y.encodeStateAsUpdate(ydoc)
+    const title = ydoc.getText('title').toString() || 'Untitled'
+    const preview = JSON.stringify(extractPreviewBlocks(ydoc))
+    upsertDoc.run(roomName, state, Date.now(), title, preview)
+    console.log(`Saved: ${roomName}`)
+  } catch (err) {
+    console.error(`Failed to save document ${roomName}:`, err)
+  }
 }
 
 const loadedRooms = new Set()
 
 function loadDocument(roomName) {
-    if (loadedRooms.has(roomName)) return
-    loadedRooms.add(roomName)
-    try {
-        const row = selectDoc.get(roomName)
-        if (row?.state) {
-            const ydoc = getYDoc(roomName)
-            Y.applyUpdate(ydoc, row.state)
-            console.log(`Loaded: ${roomName}`)
-        }
-    } catch (err) {
-        loadedRooms.delete(roomName)
-        console.error(`Failed to load document ${roomName}:`, err)
+  if (loadedRooms.has(roomName)) return
+  loadedRooms.add(roomName)
+  try {
+    const row = selectDoc.get(roomName)
+    if (row?.state) {
+      const ydoc = getYDoc(roomName)
+      Y.applyUpdate(ydoc, row.state)
+      console.log(`Loaded: ${roomName}`)
     }
+  } catch (err) {
+    loadedRooms.delete(roomName)
+    console.error(`Failed to load document ${roomName}:`, err)
+  }
 }
 
 function scheduleSave(roomName) {
-    if (saveTimeouts.has(roomName)) {
-        clearTimeout(saveTimeouts.get(roomName))
-    }
-    saveTimeouts.set(roomName, setTimeout(() => {
-        saveDocument(roomName)
-        saveTimeouts.delete(roomName)
-    }, 2000))
+  if (saveTimeouts.has(roomName)) {
+    clearTimeout(saveTimeouts.get(roomName))
+  }
+  saveTimeouts.set(roomName, setTimeout(() => {
+    saveDocument(roomName)
+    saveTimeouts.delete(roomName)
+  }, 2000))
 }
 
 backfillDocumentPreviews()
 
 function gracefulShutdown() {
-    console.log('Shutting down - saving all documents . . .')
-    for (const [roomName] of saveTimeouts) {
-        clearTimeout(saveTimeouts.get(roomName))
-        saveDocument(roomName)
-    }
-    db.close()
-    process.exit(0)
+  console.log('Shutting down - saving all documents . . .')
+  for (const [roomName] of saveTimeouts) {
+    clearTimeout(saveTimeouts.get(roomName))
+    saveDocument(roomName)
+  }
+  db.close()
+  process.exit(0)
 }
 
 process.on('SIGINT', gracefulShutdown)
@@ -545,7 +596,7 @@ const server = http.createServer(async (req, res) => {
     })
     res.write(':\n\n') // initial comment to open stream
     sseSubscribe(userId, res)
-    const keepalive = setInterval(() => { try { res.write(':\n\n') } catch {} }, 25000)
+    const keepalive = setInterval(() => { try { res.write(':\n\n') } catch { } }, 25000)
     req.on('close', () => {
       clearInterval(keepalive)
       sseUnsubscribe(userId, res)
@@ -629,6 +680,40 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  // POST /jobs
+  if (req.method === 'POST' && url.pathname === '/agent-job') {
+    let body = ''
+    req.on('data', chunk => body += chunk)
+    req.on('end', () => {
+      try {
+        const { task, document_id, mode, effort } = JSON.parse(body)
+        if (!task || !document_id || !mode || !effort) {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'task required' }))
+          return
+        }
+        const access = getAccessibleDoc.get(document_id, userId, userId)
+        if (!access) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Not authorized or document not found' }))
+          return
+        }
+        const now = Date.now()
+        const job_id = uuidv4()
+        const current_state = 'pending'
+        const timeout_at = now + (5 * 60 * 1000)
+        const effortLevel = effort ?? 'balanced'
+        const job = createAgentJob.run(job_id, task, userId, current_state, now, timeout_at, document_id, mode, effortLevel, 0, 2, null)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ job_id, status: 'pending' }))
+      } catch {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Server error' }))
+      }
+    })
+    return
+  }
+
   // DELETE /documents/:room/share/:targetUserId
   if (req.method === 'DELETE' && url.pathname.match(/^\/documents\/[^/]+\/share\/[^/]+$/)) {
     const parts = url.pathname.split('/')
@@ -654,9 +739,9 @@ const server = http.createServer(async (req, res) => {
 
   // DELETE /documents/:room
   if (req.method === 'DELETE' && url.pathname.match(/^\/documents\/[^/]+$/) &&
-      !url.pathname.includes('/share') && !url.pathname.includes('/prefs') &&
-      !url.pathname.includes('/title') && !url.pathname.includes('/shares') &&
-      !url.pathname.includes('/ai')) {
+    !url.pathname.includes('/share') && !url.pathname.includes('/prefs') &&
+    !url.pathname.includes('/title') && !url.pathname.includes('/shares') &&
+    !url.pathname.includes('/ai')) {
     const room = url.pathname.split('/')[2]
     try {
       // Get collaborators before deleting so we can notify them
@@ -771,7 +856,7 @@ const server = http.createServer(async (req, res) => {
               yTitle.insert(0, title.trim() || 'Untitled')
             })
           }
-        } catch {}
+        } catch { }
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ success: true }))
       } catch {
@@ -895,6 +980,60 @@ Rules:
     return
   }
 
+  // GET /jobs/:id — return a single job if owned by this user
+  if (req.method === 'GET' && url.pathname.match(/^\/jobs\/[^/]+$/)) {
+    const jobId = url.pathname.split('/')[2]
+    try {
+      const job = db.prepare('SELECT * FROM agent_jobs WHERE id = ?').get(jobId)
+      if (!job) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Not found' }))
+        return
+      }
+      if (job.owner !== userId) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden' }))
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(job))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Server error' }))
+    }
+    return
+  }
+
+  // GET /jobs?room=:roomId — return last 10 jobs for a room accessible to this user
+  if (req.method === 'GET' && url.pathname === '/jobs') {
+    const room = url.searchParams.get('room')
+    if (!room) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'room required' }))
+      return
+    }
+    try {
+      const access = getAccessibleDoc.get(room, userId, userId)
+      if (!access) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden' }))
+        return
+      }
+      const jobs = db.prepare(`
+        SELECT * FROM agent_jobs
+        WHERE document_id = ? AND owner = ?
+        ORDER BY created_at DESC
+        LIMIT 10
+      `).all(room, userId)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(jobs))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Server error' }))
+    }
+    return
+  }
+
   res.writeHead(200)
   res.end('CoWrite WebSocket Server')
 })
@@ -916,9 +1055,13 @@ function ssePush(userId, event, data) {
   sseClients.get(userId)?.forEach(res => {
     try {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-    } catch {}
+    } catch { }
   })
 }
+
+const { buildWorkerLoop } = require('./worker')
+const workerTick = buildWorkerLoop(db, anthropic, ssePush)
+setInterval(workerTick, 2000)
 
 // Track active WS connections: room -> Map<userId, Set<ws>>
 const roomConnections = new Map()
@@ -942,54 +1085,54 @@ function kickUserFromRoom(room, userId) {
   const byUser = roomConnections.get(room)
   if (!byUser) return
   byUser.get(userId)?.forEach(ws => {
-    try { ws.close(4403, 'Access revoked') } catch {}
+    try { ws.close(4403, 'Access revoked') } catch { }
   })
 }
 
 const wss = new WebSocketServer({ server })
 
 wss.on('connection', (ws, req) => {
-    const roomName = req.url?.slice(1).split('?')[0] || 'default'
+  const roomName = req.url?.slice(1).split('?')[0] || 'default'
 
-    // Identify connecting user from session cookie
-    const cookies = cookie.parse(req.headers.cookie || '')
-    const sid = cookies[SESSION_COOKIE]
-    const session = sid ? getSession.get(sid) : null
-    const connUserId = session ? session.user_id : null
+  // Identify connecting user from session cookie
+  const cookies = cookie.parse(req.headers.cookie || '')
+  const sid = cookies[SESSION_COOKIE]
+  const session = sid ? getSession.get(sid) : null
+  const connUserId = session ? session.user_id : null
 
-    if (connUserId) trackConnection(roomName, connUserId, ws)
+  if (connUserId) trackConnection(roomName, connUserId, ws)
 
-    const isFirstLoad = !loadedRooms.has(roomName)
+  const isFirstLoad = !loadedRooms.has(roomName)
 
-    // Load persisted state before client syncs
-    loadDocument(roomName)
+  // Load persisted state before client syncs
+  loadDocument(roomName)
 
-    // Set up Yjs WebSocket sync
-    setupWSConnection(ws, req)
+  // Set up Yjs WebSocket sync
+  setupWSConnection(ws, req)
 
-    // Schedule save on every document update
-    const ydoc = getYDoc(roomName)
-    const updateHandler = () => scheduleSave(roomName)
-    ydoc.on('update', updateHandler)
+  // Schedule save on every document update
+  const ydoc = getYDoc(roomName)
+  const updateHandler = () => scheduleSave(roomName)
+  ydoc.on('update', updateHandler)
 
-    // On first connection for a room that already has state, re-save to ensure
-    // preview_json is up to date (backfill may have missed it if state was added
-    // while the server was running)
-    if (isFirstLoad) {
-        setTimeout(() => saveDocument(roomName), 500)
-    }
+  // On first connection for a room that already has state, re-save to ensure
+  // preview_json is up to date (backfill may have missed it if state was added
+  // while the server was running)
+  if (isFirstLoad) {
+    setTimeout(() => saveDocument(roomName), 500)
+  }
 
-    ws.on('close', () => {
-        if (connUserId) untrackConnection(roomName, connUserId, ws)
-        saveDocument(roomName)
-        ydoc.off('update', updateHandler)
-        console.log(`Client disconnected from ${roomName}`)
-    })
+  ws.on('close', () => {
+    if (connUserId) untrackConnection(roomName, connUserId, ws)
+    saveDocument(roomName)
+    ydoc.off('update', updateHandler)
+    console.log(`Client disconnected from ${roomName}`)
+  })
 
-    console.log(`Client connected to ${roomName}`)
+  console.log(`Client connected to ${roomName}`)
 })
 
 const PORT = process.env.PORT || 1234
 server.listen(PORT, () => {
-    console.log(`CoWrite server running on port ${PORT}`)
+  console.log(`CoWrite server running on port ${PORT}`)
 })
