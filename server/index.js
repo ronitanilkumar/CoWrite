@@ -81,23 +81,24 @@ db.exec(`
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS agent_jobs (
-    id            TEXT PRIMARY KEY,
-    task          TEXT,
-    owner         TEXT NOT NULL REFERENCES users(id),
-    current_state TEXT DEFAULT 'pending',
-    created_at    INTEGER NOT NULL,
-    timeout_at    INTEGER,
-    document_id   TEXT NOT NULL REFERENCES documents(room) ON DELETE CASCADE,
-    mode          TEXT,
-    effort        TEXT,
-    result        TEXT,
-    attempt       INTEGER DEFAULT 0,
-    max_retries   INTEGER DEFAULT 2,
-    started_at    INTEGER,
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    model_used    TEXT,
-    error_msg    TEXT
+    id             TEXT PRIMARY KEY,
+    task           TEXT,
+    owner          TEXT NOT NULL REFERENCES users(id),
+    current_state  TEXT DEFAULT 'pending',
+    created_at     INTEGER NOT NULL,
+    timeout_at     INTEGER,
+    document_id    TEXT NOT NULL REFERENCES documents(room) ON DELETE CASCADE,
+    mode           TEXT,
+    effort         TEXT,
+    result         TEXT,
+    attempt        INTEGER DEFAULT 0,
+    max_retries    INTEGER DEFAULT 2,
+    started_at     INTEGER,
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    model_used     TEXT,
+    error_msg      TEXT,
+    snapshot_json  TEXT
   )
 `)
 
@@ -240,8 +241,8 @@ const getAccessibleDoc = db.prepare(`
 `)
 
 const createAgentJob = db.prepare(`
-  INSERT INTO agent_jobs (id, task, owner, current_state, created_at, timeout_at, document_id, mode, effort, attempt, max_retries, started_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO agent_jobs (id, task, owner, current_state, created_at, timeout_at, document_id, mode, effort, attempt, max_retries, started_at, snapshot_json)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `)
 
 const claimAgentJob = db.prepare(`
@@ -698,12 +699,39 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'Not authorized or document not found' }))
           return
         }
+        // Capture frozen snapshot of current document state
+        let snapshot_json = null
+        try {
+          const ydoc = getYDoc(document_id)
+          const xmlFragment = ydoc.getXmlFragment('default')
+          const blocks = []
+          const extractBlocks = (element) => {
+            if (element.nodeName && element.nodeName !== 'doc') {
+              const blockId = element.getAttribute && element.getAttribute('blockId')
+              const text = getNodeText(element)
+              if (blockId) {
+                blocks.push({
+                  id: blockId,
+                  type: element.nodeName,
+                  text: typeof text === 'string' ? text : JSON.stringify(text)
+                })
+              }
+            }
+            if (element.forEach) {
+              element.forEach(child => extractBlocks(child))
+            }
+          }
+          extractBlocks(xmlFragment)
+          snapshot_json = JSON.stringify(blocks)
+        } catch (e) {
+          console.error('Failed to capture snapshot:', e)
+        }
         const now = Date.now()
         const job_id = uuidv4()
         const current_state = 'pending'
         const timeout_at = now + (5 * 60 * 1000)
         const effortLevel = effort ?? 'balanced'
-        const job = createAgentJob.run(job_id, task, userId, current_state, now, timeout_at, document_id, mode, effortLevel, 0, 2, null)
+        const job = createAgentJob.run(job_id, task, userId, current_state, now, timeout_at, document_id, mode, effortLevel, 0, 2, null, snapshot_json)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ job_id, status: 'pending' }))
       } catch {
@@ -914,18 +942,18 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => body += chunk)
     req.on('end', async () => {
       try {
-        const { prompt, before, after, mode } = JSON.parse(body)
+        const { prompt, before, after, mode, selection } = JSON.parse(body)
 
         const hasContent = (before || '').trim().length > 0
 
-        const systemPrompt = `You are a writing assistant embedded inside a collaborative document editor called CoWrite. Your output is inserted directly into the document at the cursor — it must read as a seamless continuation of the author's own writing.
+        const systemPrompt = `You are a writing assistant embedded inside a collaborative document editor. Your output is inserted directly into the document — write only the content itself, nothing else.
 
 Rules:
-- Match the author's voice, tone, vocabulary, and sentence rhythm exactly. If they write casually, write casually. If they write formally, write formally.
-- Never add preamble, meta-commentary, or explanations. Output only the text to insert.
-- Use markdown formatting (headers, bullets, bold, code blocks) only if the surrounding document already uses it.
-- Do not repeat content already in the document.
-- Be substantive. Produce complete, useful content — not filler.`
+- Match the author's voice, tone, and sentence rhythm exactly.
+- Never add preamble, sign-offs, or meta-commentary of any kind. Output only the text to be inserted. Do not start with "Here is", "Sure!", or any similar phrase.
+- Use markdown formatting only if the surrounding document already uses it.
+- Do not repeat content already present. Do not introduce yourself.
+- Write substantively — complete thoughts, not filler. The user will accept or reject your output.`
 
         let userMessage
         if (mode === 'continue') {
@@ -934,14 +962,15 @@ Rules:
           } else {
             userMessage = `Start writing a document. Output the opening paragraphs.`
           }
-        } else if (mode === 'summarize') {
-          userMessage = `Write a concise summary of the following document. Match its tone. Output only the summary text.\n\n<document>\n${before}\n</document>`
         } else if (mode === 'rewrite') {
-          userMessage = `Rewrite the following passage to be clearer and more engaging, keeping the same meaning and voice.\n\n<text>\n${before.slice(-1500)}\n</text>`
+          const passage = (selection && selection.trim().length > 0) ? selection : before.slice(-2000)
+          const ctxAfter = (after || '').slice(0, 300)
+          const contextHint = ctxAfter ? `\n\nFor tone/style reference only — do not reproduce: "${ctxAfter.slice(0, 150)}…"` : ''
+          userMessage = `Rewrite the following passage per the instruction. Output only the rewritten passage — no labels, no preamble, nothing else.\n\nInstruction: "${prompt}"\n\nPassage:\n${passage}${contextHint}`
         } else {
           // write mode — user gave a prompt
           if (hasContent) {
-            userMessage = `The author is writing a document. Here is what they've written so far:\n\n<document_before_cursor>\n${before}\n</document_before_cursor>\n\nThey want you to write the following at the cursor position: "${prompt}"\n\nOutput only the requested text, written in the author's voice and style.`
+            userMessage = `The author is writing a document. Here is what they've written so far:\n\n<document_before_cursor>\n${before}\n</document_before_cursor>${after ? `\n\n<document_after_cursor>\n${after}\n</document_after_cursor>` : ''}\n\nWrite the following at the cursor position: "${prompt}"\n\nOutput only the requested text, written in the author's voice and style.`
           } else {
             userMessage = `Write the following for a new document: "${prompt}"\n\nOutput only the text.`
           }
@@ -950,11 +979,10 @@ Rules:
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*',
         })
         const stream = anthropic.messages.stream({
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 1024,
+          max_tokens: 2048,
           system: systemPrompt,
           messages: [{ role: 'user', content: userMessage }],
         })

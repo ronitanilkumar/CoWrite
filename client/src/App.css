@@ -113,11 +113,11 @@ body {
 
 /* ── Top bar ── */
 .topbar {
-  height: 44px;
+  height: 50px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 12px;
+  padding: 0 16px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--border-subtle);
 }
@@ -139,10 +139,11 @@ body {
 
 .topbar-sep {
   width: 1px;
-  height: 16px;
+  height: 14px;
   background: var(--border-subtle);
   flex-shrink: 0;
   align-self: center;
+  opacity: 0.6;
 }
 
 
@@ -159,17 +160,17 @@ body {
 }
 
 .topbar-avatar {
-  width: 18px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 600;
   color: #0c0c0c;
-  border: 1.5px solid var(--bg);
-  margin-left: -5px;
+  border: 2px solid var(--bg);
+  margin-left: -6px;
   flex-shrink: 0;
   cursor: default;
 }
@@ -319,17 +320,10 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
   border-radius: 999px;
-  padding: 3px 12px;
+  padding: 3px 10px;
   height: 26px;
-  transition: background 0.15s ease, border-color 0.15s ease;
-}
-
-.topbar-stats:hover {
-  background: color-mix(in srgb, var(--surface-2) 80%, var(--surface));
-  border-color: var(--border);
+  opacity: 0.65;
 }
 
 .topbar-stat-num {
@@ -400,6 +394,40 @@ body {
 
 .settings-section {
   padding: 4px 0;
+}
+
+.settings-stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 12px 4px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-stats-num {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.settings-stats-label {
+  color: var(--text-tertiary);
+}
+
+.settings-stats-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.settings-stats-separator {
+  color: color-mix(in srgb, var(--text-tertiary) 58%, transparent);
+  flex-shrink: 0;
 }
 
 .settings-section + .settings-section {
@@ -782,15 +810,14 @@ body {
   align-items: center;
   min-width: 40px;
   max-width: 480px;
-  margin-left: -6px;
 }
 
 /* invisible sizer — same font as input, drives the width */
 .topbar-title-sizer {
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
-  letter-spacing: -0.3px;
+  letter-spacing: -0.35px;
   padding: 3px 6px;
   white-space: pre;
   visibility: hidden;
@@ -807,10 +834,10 @@ body {
   border: none;
   outline: none;
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--text-primary);
-  letter-spacing: -0.3px;
+  letter-spacing: -0.35px;
   cursor: text;
   padding: 3px 6px;
   border-radius: 4px;
@@ -828,6 +855,28 @@ body {
 }
 
 /* ── Editor ── */
+.editor-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 20px;
+  height: 28px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.editor-statusbar-sep {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+
 .editor-container {
   flex: 1;
   overflow-y: auto;
@@ -1726,10 +1775,10 @@ body {
   align-items: center;
   gap: 1px;
   background: var(--surface);
-  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border: none;
   border-radius: 10px;
   padding: 3px 4px;
-  box-shadow: 0 4px 20px var(--shadow);
+  box-shadow: 0 4px 20px var(--shadow), 0 1px 3px rgba(0,0,0,0.06);
   pointer-events: all;
   animation: toolbar-in 0.1s ease;
 }
@@ -2213,17 +2262,33 @@ body {
   color: #cd6425;
 }
 
-/* AI-written text — subtle highlight that fades out */
-.ai-highlight-fade {
-  background: rgba(205, 100, 37, 0.10);
-  border-radius: 2px;
-  animation: ai-fade 3s ease-out forwards;
+/* AI-written text — subtle blue accent, persists until accept/discard */
+.ai-highlight-start-marker {
+  display: block;
+  width: 100%;
+  height: 0;
+  margin: 0.42em 0 0.08em;
+  border-top: 2px solid color-mix(in srgb, var(--accent-blue) 45%, transparent);
+  pointer-events: none;
 }
 
-@keyframes ai-fade {
-  0%   { background: rgba(205, 100, 37, 0.10); }
-  70%  { background: rgba(205, 100, 37, 0.06); }
-  100% { background: transparent; }
+.ai-highlight-fade {
+  background: var(--accent-blue-dim);
+  box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--accent-blue) 45%, transparent);
+  border-radius: 0px;
+  padding-bottom: 0.25em;
+  transition: background 160ms ease;
+}
+
+.ai-highlight-fade:hover {
+  background: color-mix(in srgb, var(--accent-blue) 16%, transparent);
+}
+
+/* Selection lock — visualizes the user's selection while the Ask AI
+   composer steals focus, so the target text stays visible. */
+.ai-sel-lock {
+  background: color-mix(in srgb, var(--accent-blue) 22%, transparent);
+  border-radius: 2px;
 }
 
 /* AI error toast */
@@ -2294,18 +2359,32 @@ body {
 
 .agent-topbar-btn {
   position: relative;
+  isolation: isolate;
+  background: color-mix(in srgb, var(--accent-dim) 60%, transparent) !important;
+  border-color: transparent !important;
+  color: var(--text-secondary) !important;
+}
+
+.agent-topbar-btn:hover,
+.agent-topbar-btn.active {
+  background: var(--accent-dim) !important;
+  color: var(--text-primary) !important;
 }
 
 .agent-topbar-btn-dot {
   display: none;
+}
+
+.agent-new-badge {
+  display: none;
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: #f0a030;
+  background: var(--accent-blue);
   flex-shrink: 0;
 }
 
-.agent-topbar-btn.has-results .agent-topbar-btn-dot {
+.agent-topbar-btn.has-results .agent-new-badge {
   display: block;
 }
 
@@ -2313,7 +2392,7 @@ body {
 
 .agent-panel {
   position: fixed;
-  top: 44px;
+  top: 50px;
   right: 0;
   bottom: 0;
   width: var(--agent-panel-width);
@@ -2376,7 +2455,6 @@ body {
   padding: 0 20px;
   flex-shrink: 0;
   gap: 8px;
-  border-bottom: 1px solid var(--border-subtle);
 }
 
 .agent-panel-header-left {
@@ -2640,13 +2718,13 @@ body {
   align-items: center;
   gap: 4px;
   padding: 4px 10px;
-  height: 26px;
-  border-radius: var(--radius);
+  height: 28px;
+  border-radius: 8px;
   font-family: var(--font);
   font-size: 12px;
   font-weight: 500;
-  border: 1px solid var(--border);
-  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 90%, transparent);
+  background: var(--surface);
   color: var(--text-secondary);
   cursor: pointer;
   white-space: nowrap;
@@ -2654,18 +2732,22 @@ body {
 }
 
 .agent-turn-action-btn:hover {
-  background: var(--accent-dim);
+  background: color-mix(in srgb, var(--surface-2) 84%, transparent);
   color: var(--text-primary);
-  border-color: transparent;
+  border-color: color-mix(in srgb, var(--border) 100%, transparent);
 }
 
 .agent-turn-action-btn--primary {
-  background: var(--accent-blue);
-  color: #fff;
+  background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  color: color-mix(in srgb, var(--accent-blue) 90%, var(--text-primary));
   border-color: transparent;
+  font-weight: 550;
 }
 
-.agent-turn-action-btn--primary:hover { opacity: 0.88; }
+.agent-turn-action-btn--primary:hover {
+  background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
+  color: var(--accent-blue);
+}
 
 .agent-turn-action-btn--danger {
   background: rgba(220, 60, 60, 0.12);
@@ -2687,13 +2769,14 @@ body {
 }
 
 .agent-composer-card {
-  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
   border-radius: 16px;
   background: var(--surface);
-  padding: 12px 14px 10px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
 .agent-composer-textarea {
@@ -2719,6 +2802,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
 
 .agent-composer-dropdowns {
@@ -2731,19 +2815,25 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: none;
-  background: var(--text-primary);
-  color: var(--bg);
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--accent-blue);
+  background: var(--accent-blue);
+  color: #fff;
   cursor: pointer;
   flex-shrink: 0;
-  transition: opacity 0.12s, transform 0.1s;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+  box-shadow: none;
 }
 
-.agent-composer-send:hover:not(:disabled) { opacity: 0.85; }
-.agent-composer-send:active:not(:disabled) { transform: scale(0.93); }
+.agent-composer-send:hover:not(:disabled) {
+  opacity: 1;
+  transform: none;
+  background: color-mix(in srgb, var(--accent-blue) 88%, black);
+  border-color: color-mix(in srgb, var(--accent-blue) 88%, black);
+}
+.agent-composer-send:active:not(:disabled) { transform: none; }
 
 .agent-composer-send:disabled {
   opacity: 0.25;
@@ -2757,27 +2847,27 @@ body {
 }
 
 .agent-panel .agent-dropdown-trigger {
-  height: 26px;
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: transparent;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 8px;
+  background: var(--surface);
   color: var(--text-secondary);
   font-family: var(--font);
   font-size: 12px;
   font-weight: 500;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   cursor: pointer;
   transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
 }
 
 .agent-panel .agent-dropdown-trigger:hover,
 .agent-panel .agent-dropdown-trigger.open {
-  background: var(--accent-dim);
+  background: color-mix(in srgb, var(--surface-2) 88%, transparent);
   color: var(--text-primary);
-  border-color: transparent;
+  border-color: color-mix(in srgb, var(--border) 100%, transparent);
 }
 
 .agent-panel .agent-dropdown-trigger .agent-dropdown-trigger-icon {
@@ -2871,4 +2961,471 @@ body {
   font-size: 11px;
   color: var(--text-tertiary);
   line-height: 1.3;
+}
+
+/* ── Floating toolbar unified card ── */
+.floating-toolbar-card {
+  position: fixed;
+  z-index: 300;
+  background: var(--surface);
+  border: none;
+  border-radius: 10px;
+  box-shadow: 0 4px 24px var(--shadow), 0 1px 3px rgba(0,0,0,0.06);
+  pointer-events: all;
+  animation: toolbar-in 0.1s ease;
+  overflow: hidden;
+  /* min-width matches pill row; expands when AI composer is open */
+  width: max-content;
+}
+
+.floating-toolbar-card.ai-open {
+  width: 348px;
+}
+
+/* Row of format buttons */
+.floating-toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 4px;
+}
+
+/* Ask AI button — sits inside the pill row */
+.floating-toolbar-ask-ai {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  color: color-mix(in srgb, var(--accent-blue) 80%, var(--text-primary));
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+  flex-shrink: 0;
+}
+
+.floating-toolbar-ask-ai:hover {
+  background: color-mix(in srgb, var(--accent-blue) 16%, transparent);
+  color: var(--accent-blue);
+}
+.floating-toolbar-ask-ai.active {
+  background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
+  color: var(--accent-blue);
+}
+
+/* Divider between pill row and composer */
+.floating-toolbar-card.ai-open .floating-toolbar-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+}
+
+/* AI composer — extends the card downward */
+.floating-toolbar-ai-composer {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 8px 8px;
+  background: var(--surface);
+}
+
+.floating-toolbar-ai-input-shell {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  background: color-mix(in srgb, var(--surface-2) 60%, transparent);
+  border-radius: 10px;
+  padding: 6px 6px 6px 12px;
+  transition: box-shadow 0.16s ease;
+}
+
+.floating-toolbar-ai-input-shell:focus-within {
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--accent-blue) 28%, transparent);
+}
+
+.floating-toolbar-ai-textarea {
+  display: block;
+  flex: 1;
+  min-height: 24px;
+  max-height: 120px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.55;
+  overflow-y: auto;
+}
+
+.floating-toolbar-ai-textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+.floating-toolbar-ai-send {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
+  color: color-mix(in srgb, var(--accent-blue) 85%, var(--text-primary));
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.floating-toolbar-ai-send:disabled { opacity: 0.3; cursor: default; }
+.floating-toolbar-ai-send:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent-blue) 28%, transparent);
+  color: var(--accent-blue);
+}
+
+/* ── AI result bar (streaming + done, anchored above selection) ── */
+.ai-result-bar {
+  position: fixed;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 36px;
+  padding: 0 8px;
+  background: var(--surface);
+  border: none;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.10), 0 1px 4px rgba(0, 0, 0, 0.06);
+  pointer-events: all;
+  animation: toolbar-in 0.12s ease;
+  white-space: nowrap;
+}
+
+/* streaming state */
+.ai-result-bar-spinner {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--accent-blue) 20%, transparent);
+  border-top-color: var(--accent-blue);
+  flex-shrink: 0;
+  animation: ai-spin 0.75s linear infinite;
+}
+
+@keyframes ai-spin {
+  to { transform: rotate(360deg); }
+}
+
+.ai-result-bar-label {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  min-width: 80px;
+}
+
+.ai-result-bar-cancel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.ai-result-bar-cancel:hover {
+  background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+  border-color: color-mix(in srgb, var(--border) 80%, transparent);
+  color: var(--text-secondary);
+}
+
+/* done state */
+.ai-result-bar--done .ai-result-bar-done-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  letter-spacing: 0.01em;
+  padding: 0 6px;
+}
+
+.ai-result-bar-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--border);
+  flex-shrink: 0;
+  margin: 0 4px;
+  opacity: 0.6;
+}
+
+.ai-result-bar-action {
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.ai-result-bar-action:hover {
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  color: var(--text-primary);
+}
+
+.ai-result-bar-action--primary {
+  background: color-mix(in srgb, var(--accent-blue) 11%, transparent);
+  color: color-mix(in srgb, var(--accent-blue) 88%, var(--text-primary));
+  font-weight: 500;
+  margin-left: 2px;
+}
+
+.ai-result-bar-action--primary:hover {
+  background: color-mix(in srgb, var(--accent-blue) 19%, transparent);
+  color: var(--accent-blue);
+}
+
+/* ── Agent turn context pill (collapsed reference shown in chat history) ── */
+.agent-turn-context-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  margin-bottom: 6px;
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
+  border: none;
+  border-radius: 8px;
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  transition: background 0.12s;
+  flex-wrap: wrap;
+}
+
+.agent-turn-context-pill:hover {
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  color: var(--text-primary);
+}
+
+.agent-turn-context-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.agent-turn-context-title {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.agent-turn-context-subtitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-turn-context-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.agent-turn-context-chevron {
+  flex-shrink: 0;
+  transition: transform 0.15s;
+  opacity: 0.6;
+}
+
+.agent-turn-context-pill.expanded .agent-turn-context-chevron {
+  transform: rotate(180deg);
+}
+
+.agent-turn-context-body {
+  width: 100%;
+  margin-top: 4px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
+  border: none;
+  border-radius: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  line-height: 1.6;
+}
+
+.agent-turn-context-body-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.agent-turn-context-body-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Composer-attached context card (from "Chat more →") ── */
+.agent-composer-context {
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
+  border: none;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-composer-context-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agent-composer-context-head-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent-composer-context-eyebrow {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+}
+
+.agent-composer-context-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-composer-context-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.agent-composer-context-toggle {
+  display: inline-flex;
+  align-items: center;
+  height: auto;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--accent-blue) 80%, var(--text-secondary));
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.12s;
+}
+
+.agent-composer-context-toggle:hover {
+  color: var(--accent-blue);
+  background: transparent;
+  border-color: transparent;
+}
+
+.agent-composer-context-dismiss {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
+}
+
+.agent-composer-context-dismiss:hover {
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  color: var(--text-secondary);
+}
+
+.agent-composer-context-note {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+/* ── ai-edit-box (legacy class kept for slash-menu write mode) ── */
+.ai-edit-box {
+  position: fixed;
+  z-index: 400;
+  width: 300px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px var(--shadow);
+  overflow: hidden;
+  animation: toolbar-in 0.12s ease;
+}
+.ai-edit-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #cd6425;
+}
+.ai-edit-textarea {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+.ai-edit-footer {
+  padding: 4px 12px 8px;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
 }

@@ -244,13 +244,14 @@ export async function streamAIContent(
   onToken: (token: string) => void,
   onDone: () => void,
   onError: (err: Error) => void,
+  selection?: string,
 ): Promise<void> {
   try {
     const res = await fetch(`${BASE}/documents/${room}/ai`, {
       ...OPTS,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, before, after, mode }),
+      body: JSON.stringify({ prompt, before, after, mode, selection }),
     })
     if (!res.ok) throw new Error(`AI request failed: ${res.status}`)
     const reader = res.body!.getReader()

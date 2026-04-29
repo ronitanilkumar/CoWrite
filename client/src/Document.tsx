@@ -1,4 +1,7 @@
 import { useEditor, EditorContent, Extension, NodeViewWrapper, NodeViewContent, ReactNodeViewRenderer } from '@tiptap/react'
+import { Paragraph } from '@tiptap/extension-paragraph'
+import { Heading } from '@tiptap/extension-heading'
+import { Blockquote } from '@tiptap/extension-blockquote'
 import { TextSelection, Plugin, PluginKey } from '@tiptap/pm/state'
 import { DecorationSet, Decoration } from '@tiptap/pm/view'
 import StarterKit from '@tiptap/starter-kit'
@@ -16,11 +19,11 @@ import Suggestion from '@tiptap/suggestion'
 import { common, createLowlight } from 'lowlight'
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, type ComponentType } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from './AuthContext'
-import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, getJobResult, getDocumentJobs, submitAgentJob, type AgentJobResult, type DocPrefs } from './api'
-import { createPortal } from 'react-dom'
+import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, getJobResult, getDocumentJobs, submitAgentJob, type DocPrefs } from './api'
+import { createPortal, flushSync } from 'react-dom'
 import { marked } from 'marked'
 import {
   Heading1, Heading2, Heading3, List, ListOrdered,
@@ -30,7 +33,7 @@ import {
   Bold, Italic, Strikethrough,
   Copy, Check, ChevronDown,
   GripVertical, Trash2, CopyPlus, Plus,
-  ArrowLeft, ArrowUp, Share2, Link, Search, Sparkles, X, Gauge,
+  ArrowLeft, ArrowUp, Share2, Link, Search, Sparkles, X, Gauge, MessageCircle,
 } from 'lucide-react'
 import './App.css'
 
@@ -52,6 +55,13 @@ function buildAIDecos(doc: any, from: number, to: number): DecorationSet {
   to = Math.min(doc.content.size, to)
   if (from >= to) return DecorationSet.empty
   const decos: Decoration[] = []
+  decos.push(Decoration.widget(from, () => {
+    const marker = document.createElement('span')
+    marker.className = 'ai-highlight-start-marker'
+    marker.setAttribute('contenteditable', 'false')
+    marker.setAttribute('aria-hidden', 'true')
+    return marker
+  }, { side: -1 }))
   doc.nodesBetween(from, to, (node: any, pos: number) => {
     if (!node.isBlock || node.childCount === 0) return
     decos.push(Decoration.node(pos, pos + node.nodeSize, { class: 'ai-highlight-fade' }))
@@ -78,9 +88,38 @@ function makeAIDecoPlugin() {
   })
 }
 
+// ── Selection-lock highlight: visualizes the selection while a focus-stealing
+// UI (Ask AI composer) is open so the user can still see what they targeted.
+const selLockKey = new PluginKey<DecorationSet>('selLock')
+
+function makeSelLockPlugin() {
+  return new Plugin({
+    key: selLockKey,
+    state: {
+      init: () => DecorationSet.empty,
+      apply(tr, set) {
+        const meta = tr.getMeta(selLockKey)
+        if (meta === null) return DecorationSet.empty
+        if (meta) {
+          const from = Math.max(0, Math.min(meta.from, tr.doc.content.size))
+          const to = Math.max(0, Math.min(meta.to, tr.doc.content.size))
+          if (from >= to) return DecorationSet.empty
+          return DecorationSet.create(tr.doc, [
+            Decoration.inline(from, to, { class: 'ai-sel-lock' }),
+          ])
+        }
+        return set.map(tr.mapping, tr.doc)
+      },
+    },
+    props: {
+      decorations(state) { return selLockKey.getState(state) },
+    },
+  })
+}
+
 const AI_DECO_EXTENSION = Extension.create({
   name: 'aiDecorations',
-  addProseMirrorPlugins() { return [makeAIDecoPlugin()] },
+  addProseMirrorPlugins() { return [makeAIDecoPlugin(), makeSelLockPlugin()] },
 })
 
 /** Convert plain text (with \n\n paragraph breaks) to TipTap-compatible JSON content */
@@ -103,6 +142,70 @@ const LANGUAGES = [
   'bash', 'sql', 'rust', 'go', 'java', 'c', 'cpp', 'ruby', 'php', 'swift',
   'kotlin', 'yaml', 'markdown', 'xml',
 ]
+
+const ParagraphWithId = Paragraph.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      blockId: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-block-id'),
+        renderHTML: attributes => {
+          if (!attributes.blockId) return {}
+          return { 'data-block-id': attributes.blockId }
+        }
+      }
+    }
+  }
+})
+
+const HeadingWithId = Heading.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      blockId: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-block-id'),
+        renderHTML: attributes => {
+          if (!attributes.blockId) return {}
+          return { 'data-block-id': attributes.blockId }
+        }
+      }
+    }
+  }
+})
+
+const BlockquoteWithId = Blockquote.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      blockId: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-block-id'),
+        renderHTML: attributes => {
+          if (!attributes.blockId) return {}
+          return { 'data-block-id': attributes.blockId }
+        }
+      }
+    }
+  }
+})
+
+const TaskItemWithId = TaskItem.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      blockId: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-block-id'),
+        renderHTML: attributes => {
+          if (!attributes.blockId) return {}
+          return { 'data-block-id': attributes.blockId }
+        }
+      }
+    }
+  }
+}).configure({ nested: true })
 
 // ── Code block with language selector ───────────────────────────────
 function CodeBlockView({ node, updateAttributes }: any) {
@@ -322,14 +425,9 @@ const TaskListExit = Extension.create({
 })
 
 // ── Slash command items ──────────────────────────────────────────────
-const AI_SUBMODES = [
-  { aiMode: 'write' as const,    label: 'Write',    desc: 'Ask AI to write something' },
-  { aiMode: 'continue' as const, label: 'Continue', desc: 'Continue writing from cursor' },
-  { aiMode: 'summarize' as const, label: 'Summarize', desc: 'Summarize this document' },
-]
-
 const slashItems = [
-  { title: 'Ask AI', subtitle: 'Write, continue, or summarize', icon: ClaudeIcon, isAIGroup: true, command: (_e: any) => {} },
+  { title: 'AI: Write', subtitle: 'Ask AI to write something', icon: ClaudeIcon, isAI: true, aiMode: 'write' as const, needsPrompt: true, command: (_e: any) => { } },
+  { title: 'AI: Continue', subtitle: 'Continue writing from cursor', icon: ClaudeIcon, isAI: true, aiMode: 'continue' as const, needsPrompt: false, command: (_e: any) => { } },
   { title: 'Heading 1', subtitle: 'Large section heading', icon: Heading1, command: (e: any) => e.chain().focus().toggleHeading({ level: 1 }).run() },
   { title: 'Heading 2', subtitle: 'Medium section heading', icon: Heading2, command: (e: any) => e.chain().focus().toggleHeading({ level: 2 }).run() },
   { title: 'Heading 3', subtitle: 'Small section heading', icon: Heading3, command: (e: any) => e.chain().focus().toggleHeading({ level: 3 }).run() },
@@ -354,73 +452,48 @@ function SlashAlignJustify({ items, selectedIndex, position, onSelect }: {
   onSelect: (item: any) => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
-  const [aiExpanded, setAiExpanded] = useState(false)
 
   useEffect(() => {
     const el = ref.current?.querySelector('.selected')
     el?.scrollIntoView({ block: 'nearest' })
   }, [selectedIndex])
 
-  // Flatten items for selectedIndex tracking: AI group counts as 1 when collapsed, 4 when expanded
-  const flatItems: any[] = []
-  items.forEach(item => {
-    if ((item as any).isAIGroup) {
-      flatItems.push(item)
-      if (aiExpanded) {
-        AI_SUBMODES.forEach(sub => flatItems.push({ ...sub, isAISub: true }))
-      }
-    } else {
-      flatItems.push(item)
-    }
-  })
+  const aiItems = items.filter((item: any) => item.isAI)
+  const otherItems = items.filter((item: any) => !item.isAI)
 
   return createPortal(
     <div className="slash-menu" style={{ top: position.top, left: position.left }} ref={ref}>
-      {flatItems.length === 0
+      {items.length === 0
         ? <div className="slash-menu-empty">No results</div>
-        : flatItems.map((item, i) => {
-          if (item.isAISub) {
+        : (() => {
+          const allItems = aiItems.length > 0 && otherItems.length > 0
+            ? [...aiItems, null, ...otherItems]
+            : items
+          let visualIndex = 0
+          return allItems.map((item) => {
+            if (item === null) {
+              return <div key="ai-divider" className="slash-menu-ai-divider" />
+            }
+            const i = visualIndex++
+            const Icon = (item as any).icon
+            const isAI = (item as any).isAI
             return (
               <div
-                key={`ai-sub-${item.aiMode}`}
-                className={`slash-menu-item slash-menu-ai-sub ${i === selectedIndex ? 'selected' : ''}`}
-                onMouseDown={e => { e.preventDefault(); onSelect({ isAI: true, aiMode: item.aiMode, promptText: '' }) }}
+                key={(item as any).title}
+                className={`slash-menu-item ${isAI ? 'slash-menu-ai-item' : ''} ${i === selectedIndex ? 'selected' : ''}`}
+                onMouseDown={e => { e.preventDefault(); onSelect(item) }}
               >
-                <div className="slash-menu-ai-sub-icon"><ClaudeIcon size={11} /></div>
+                <div className={`slash-menu-icon ${isAI ? 'slash-menu-ai-icon' : ''}`}>
+                  <Icon size={14} strokeWidth={2} />
+                </div>
                 <div className="slash-menu-text">
-                  <div className="slash-menu-title">{item.label}</div>
-                  <div className="slash-menu-subtitle">{item.desc}</div>
+                  <div className="slash-menu-title">{(item as any).title}</div>
+                  <div className="slash-menu-subtitle">{(item as any).subtitle}</div>
                 </div>
               </div>
             )
-          }
-          const Icon = item.icon
-          const isGroup = (item as any).isAIGroup
-          return (
-            <div
-              key={item.title}
-              className={`slash-menu-item ${isGroup ? 'slash-menu-ai-group' : ''} ${i === selectedIndex ? 'selected' : ''}`}
-              onMouseDown={e => {
-                e.preventDefault()
-                if (isGroup) setAiExpanded(v => !v)
-                else onSelect(item)
-              }}
-            >
-              <div className={`slash-menu-icon ${isGroup ? 'slash-menu-ai-icon' : ''}`}>
-                <Icon size={14} strokeWidth={2} />
-              </div>
-              <div className="slash-menu-text">
-                <div className="slash-menu-title">{item.title}</div>
-                <div className="slash-menu-subtitle">{item.subtitle}</div>
-              </div>
-              {isGroup && (
-                <div className={`slash-menu-ai-chevron ${aiExpanded ? 'open' : ''}`}>
-                  <ChevronDown size={12} strokeWidth={2} />
-                </div>
-              )}
-            </div>
-          )
-        })
+          })
+        })()
       }
     </div>,
     document.body
@@ -432,6 +505,7 @@ function makeSlashExtension(
   suggestionRef: { current: any },
   onOpenOrUpdate: (props: any) => void,
   onClose: () => void,
+  getHasSelection: () => boolean,
 ) {
   return Extension.create({
     name: 'slashCommands',
@@ -447,11 +521,12 @@ function makeSlashExtension(
           },
           items: ({ query }: { query: string }) => {
             const lower = query.toLowerCase()
-            if (lower.startsWith('ai ') && query.length > 3) {
-              const promptText = query.slice(3).trim()
-              return [{ title: `AI: "${promptText}"`, subtitle: 'Ask AI to write this', icon: ClaudeIcon, isAIGroup: false, isAI: true, aiMode: 'write' as const, promptText, command: (_e: any) => {} }]
-            }
-            return slashItems.filter(i => i.title.toLowerCase().includes(lower))
+            const hasSelection = getHasSelection()
+            const rewriteItem = hasSelection
+              ? [{ title: 'AI: Rewrite selection', subtitle: 'Rewrite selected text with AI', icon: ClaudeIcon, isAI: true, aiMode: 'rewrite' as const, needsPrompt: true, isRewrite: true, command: (_e: any) => { } }]
+              : []
+            const base = [...rewriteItem, ...slashItems]
+            return base.filter(i => i.title.toLowerCase().includes(lower))
           },
           render: () => ({
             onStart: (props: any) => { suggestionRef.current = props; onOpenOrUpdate(props) },
@@ -468,6 +543,9 @@ function makeSlashExtension(
 // ── Word count helpers ───────────────────────────────────────────────
 function countWords(text: string) {
   return text.trim() === '' ? 0 : text.trim().split(/\s+/).length
+}
+function countCharacters(text: string) {
+  return text.length
 }
 function readingTime(words: number) {
   if (words < 200) return '< 1 min'
@@ -521,26 +599,47 @@ const turnIntoItems = [
 ]
 
 // ── Floating selection toolbar ───────────────────────────────────────
-function FloatingToolbar({ editor }: { editor: any }) {
-  const [state, setState] = useState<{ visible: boolean; top: number; left: number }>({
-    visible: false, top: 0, left: 0,
-  })
+function FloatingToolbar({ editor, onAIEdit }: {
+  editor: any
+  onAIEdit?: (selectedText: string, from: number, to: number, pos: { top: number; left: number }, promptText: string) => void
+}) {
+  const [toolbarPos, setToolbarPos] = useState<{ top: number; left: number; selTop: number; selLeft: number } | null>(null)
+  const [aiOpen, setAiOpen] = useState(false)
+  const [aiPrompt, setAiPrompt] = useState('')
+  // Snapshot of selection at the moment Ask AI is clicked — stays stable while textarea is focused
+  const selSnap = useRef<{ from: number; to: number; selectedText: string } | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  // Ref mirror of aiOpen — always current inside the selectionUpdate closure
+  const aiOpenRef = useRef(false)
+
+  // Auto-resize textarea: starts at single line, grows up to 120px
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(Math.max(el.scrollHeight, 24), 120) + 'px'
+  }, [aiPrompt])
+
+  // Keep aiOpenRef in sync with aiOpen state
+  useEffect(() => { aiOpenRef.current = aiOpen }, [aiOpen])
 
   useEffect(() => {
     const update = () => {
       if (!editor || editor.state.selection.empty) {
-        setState(s => ({ ...s, visible: false }))
+        // Don't hide if AI panel is open — we've locked the selection snapshot
+        if (!aiOpenRef.current) setToolbarPos(null)
         return
       }
       const { from, to } = editor.state.selection
       const fromCoords = editor.view.coordsAtPos(from)
       const toCoords = editor.view.coordsAtPos(to)
-      const rawTop = Math.min(fromCoords.top, toCoords.top) - 44
-      const rawLeft = (fromCoords.left + toCoords.left) / 2 - 120
-      setState({
-        visible: true,
+      const rawTop = Math.min(fromCoords.top, toCoords.top) - 52
+      const rawLeft = (fromCoords.left + toCoords.left) / 2 - 140
+      setToolbarPos({
         top: Math.max(8, rawTop),
-        left: Math.max(8, Math.min(rawLeft, window.innerWidth - 248)),
+        left: Math.max(8, Math.min(rawLeft, window.innerWidth - 320)),
+        selTop: Math.min(fromCoords.top, toCoords.top),
+        selLeft: fromCoords.left,
       })
     }
     editor.on('selectionUpdate', update)
@@ -551,58 +650,149 @@ function FloatingToolbar({ editor }: { editor: any }) {
     }
   }, [editor])
 
-  if (!state.visible) return null
+  if (!toolbarPos) return null
+
+  const handleAskAIClick = (e: React.MouseEvent) => {
+    e.preventDefault()
+    if (aiOpen) {
+      setAiOpen(false)
+      setAiPrompt('')
+      selSnap.current = null
+      // clear the visual selection lock
+      const tr = editor.state.tr.setMeta(selLockKey, null)
+      editor.view.dispatch(tr)
+      return
+    }
+    // Snapshot current selection before textarea steals focus
+    const { from, to } = editor.state.selection
+    selSnap.current = {
+      from,
+      to,
+      selectedText: editor.state.doc.textBetween(from, to, '\n'),
+    }
+    // Apply the selection-lock decoration so the highlight stays visible
+    // even after the editor loses focus to the prompt textarea.
+    const tr = editor.state.tr.setMeta(selLockKey, { from, to })
+    editor.view.dispatch(tr)
+    setAiOpen(true)
+    setTimeout(() => textareaRef.current?.focus(), 0)
+  }
+
+  const handleAISubmit = () => {
+    const snap = selSnap.current
+    if (!aiPrompt.trim() || !onAIEdit || !snap) return
+    const prompt = aiPrompt.trim()
+    // Compute bar position: just above the selection top
+    const barPos = { top: toolbarPos.selTop - 44, left: toolbarPos.selLeft }
+    // Flush synchronously so the toolbar DOM is gone before the AI stream starts
+    flushSync(() => {
+      setToolbarPos(null)
+      setAiOpen(false)
+      setAiPrompt('')
+    })
+    selSnap.current = null
+    onAIEdit(snap.selectedText, snap.from, snap.to, barPos, prompt)
+  }
 
   return createPortal(
+    // e.preventDefault() on the entire portal prevents any mouse interaction from
+    // blurring the editor or collapsing the selection
     <div
-      className="floating-toolbar"
-      style={{ top: state.top, left: state.left }}
+      className={`floating-toolbar-card${aiOpen ? ' ai-open' : ''}`}
+      style={{ top: toolbarPos.top, left: toolbarPos.left }}
       onMouseDown={e => e.preventDefault()}
     >
-      <button
-        className={`floating-toolbar-btn ${editor.isActive('bold') ? 'active' : ''}`}
-        onClick={() => editor.chain().focus().toggleBold().run()}
-        title="Bold"
-      >
-        <Bold size={14} strokeWidth={2} />
-      </button>
-      <button
-        className={`floating-toolbar-btn ${editor.isActive('italic') ? 'active' : ''}`}
-        onClick={() => editor.chain().focus().toggleItalic().run()}
-        title="Italic"
-      >
-        <Italic size={14} strokeWidth={2} />
-      </button>
-      <button
-        className={`floating-toolbar-btn ${editor.isActive('strike') ? 'active' : ''}`}
-        onClick={() => editor.chain().focus().toggleStrike().run()}
-        title="Strikethrough"
-      >
-        <Strikethrough size={14} strokeWidth={2} />
-      </button>
-      <div className="floating-toolbar-divider" />
-      <button
-        className={`floating-toolbar-btn ${editor.isActive('heading', { level: 1 }) ? 'active' : ''}`}
-        onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
-        title="Heading 1"
-      >
-        <Heading1 size={14} strokeWidth={2} />
-      </button>
-      <button
-        className={`floating-toolbar-btn ${editor.isActive('heading', { level: 2 }) ? 'active' : ''}`}
-        onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
-        title="Heading 2"
-      >
-        <Heading2 size={14} strokeWidth={2} />
-      </button>
-      <div className="floating-toolbar-divider" />
-      <button
-        className={`floating-toolbar-btn ${editor.isActive('code') ? 'active' : ''}`}
-        onClick={() => editor.chain().focus().toggleCode().run()}
-        title="Inline Code"
-      >
-        <Code size={14} strokeWidth={2} />
-      </button>
+      {/* Pill row */}
+      <div className="floating-toolbar-row">
+        <button
+          className={`floating-toolbar-btn ${editor.isActive('bold') ? 'active' : ''}`}
+          onClick={() => editor.chain().focus().toggleBold().run()}
+          title="Bold"
+        >
+          <Bold size={14} strokeWidth={2} />
+        </button>
+        <button
+          className={`floating-toolbar-btn ${editor.isActive('italic') ? 'active' : ''}`}
+          onClick={() => editor.chain().focus().toggleItalic().run()}
+          title="Italic"
+        >
+          <Italic size={14} strokeWidth={2} />
+        </button>
+        <button
+          className={`floating-toolbar-btn ${editor.isActive('strike') ? 'active' : ''}`}
+          onClick={() => editor.chain().focus().toggleStrike().run()}
+          title="Strikethrough"
+        >
+          <Strikethrough size={14} strokeWidth={2} />
+        </button>
+        <div className="floating-toolbar-divider" />
+        <button
+          className={`floating-toolbar-btn ${editor.isActive('heading', { level: 1 }) ? 'active' : ''}`}
+          onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
+          title="Heading 1"
+        >
+          <Heading1 size={14} strokeWidth={2} />
+        </button>
+        <button
+          className={`floating-toolbar-btn ${editor.isActive('heading', { level: 2 }) ? 'active' : ''}`}
+          onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
+          title="Heading 2"
+        >
+          <Heading2 size={14} strokeWidth={2} />
+        </button>
+        <div className="floating-toolbar-divider" />
+        <button
+          className={`floating-toolbar-btn ${editor.isActive('code') ? 'active' : ''}`}
+          onClick={() => editor.chain().focus().toggleCode().run()}
+          title="Inline Code"
+        >
+          <Code size={14} strokeWidth={2} />
+        </button>
+        {onAIEdit && (
+          <>
+            <div className="floating-toolbar-divider" />
+            <button
+              className={`floating-toolbar-ask-ai${aiOpen ? ' active' : ''}`}
+              onMouseDown={handleAskAIClick}
+              type="button"
+            >
+              Ask AI
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* AI composer — expands below pill row, visually attached */}
+      {aiOpen && (
+        <div className="floating-toolbar-ai-composer">
+          <div className="floating-toolbar-ai-input-shell">
+            <textarea
+              ref={textareaRef}
+              className="floating-toolbar-ai-textarea"
+              placeholder="Ask AI to edit this selection…"
+              value={aiPrompt}
+              onChange={e => setAiPrompt(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleAISubmit() }
+                if (e.key === 'Escape') {
+                  setAiOpen(false); setAiPrompt(''); selSnap.current = null
+                  const tr = editor.state.tr.setMeta(selLockKey, null)
+                  editor.view.dispatch(tr)
+                }
+              }}
+              rows={1}
+            />
+            <button
+              className="floating-toolbar-ai-send"
+              onMouseDown={e => { e.preventDefault(); handleAISubmit() }}
+              disabled={!aiPrompt.trim()}
+              type="button"
+            >
+              <ArrowUp size={13} strokeWidth={2.5} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>,
     document.body
   )
@@ -848,72 +1038,72 @@ function BlockHandle({ editor }: { editor: any }) {
         onMouseLeave={handleMouseLeave}
         ref={menuRef}
       >
-      <button
-        className="block-handle-btn"
-        onClick={handleAdd}
-        onMouseDown={e => e.preventDefault()}
-        type="button"
-        title="Add block below"
-      >
-        <Plus size={14} strokeWidth={2} />
-      </button>
-      <button
-        className="block-handle-btn"
-        onClick={() => {
-          if (hoveredPos != null) {
-            // Set node selection so Backspace/Delete natively removes the block
-            editor.chain().focus().setNodeSelection(hoveredPos).run()
-          }
-          setMenuOpen(o => !o)
-        }}
-        onMouseDown={e => e.preventDefault()}
-        type="button"
-        title="Block actions"
-      >
-        <GripVertical size={14} strokeWidth={2} />
-      </button>
-      {menuOpen && (
-        <div className="block-handle-menu" onMouseDown={e => e.preventDefault()}>
-          <div className="block-handle-menu-group">
-            <div className="block-handle-menu-section">Turn into</div>
-            {turnIntoItems.map(item => {
-              const Icon = item.icon
-              const isActive = item.check(editor)
-              return (
-                <button
-                  key={item.title}
-                  className={`block-handle-menu-item ${isActive ? 'active' : ''}`}
-                  onClick={() => handleTurnInto(item)}
-                  type="button"
-                >
-                  <div className="block-handle-menu-icon"><Icon size={14} strokeWidth={2} /></div>
-                  <span>{item.title}</span>
-                  {isActive && <Check size={11} strokeWidth={2.5} className="block-handle-check" />}
-                </button>
-              )
-            })}
+        <button
+          className="block-handle-btn"
+          onClick={handleAdd}
+          onMouseDown={e => e.preventDefault()}
+          type="button"
+          title="Add block below"
+        >
+          <Plus size={14} strokeWidth={2} />
+        </button>
+        <button
+          className="block-handle-btn"
+          onClick={() => {
+            if (hoveredPos != null) {
+              // Set node selection so Backspace/Delete natively removes the block
+              editor.chain().focus().setNodeSelection(hoveredPos).run()
+            }
+            setMenuOpen(o => !o)
+          }}
+          onMouseDown={e => e.preventDefault()}
+          type="button"
+          title="Block actions"
+        >
+          <GripVertical size={14} strokeWidth={2} />
+        </button>
+        {menuOpen && (
+          <div className="block-handle-menu" onMouseDown={e => e.preventDefault()}>
+            <div className="block-handle-menu-group">
+              <div className="block-handle-menu-section">Turn into</div>
+              {turnIntoItems.map(item => {
+                const Icon = item.icon
+                const isActive = item.check(editor)
+                return (
+                  <button
+                    key={item.title}
+                    className={`block-handle-menu-item ${isActive ? 'active' : ''}`}
+                    onClick={() => handleTurnInto(item)}
+                    type="button"
+                  >
+                    <div className="block-handle-menu-icon"><Icon size={14} strokeWidth={2} /></div>
+                    <span>{item.title}</span>
+                    {isActive && <Check size={11} strokeWidth={2.5} className="block-handle-check" />}
+                  </button>
+                )
+              })}
+            </div>
+            <div className="block-handle-menu-sep" />
+            <div className="block-handle-menu-group">
+              <div className="block-handle-menu-section">Actions</div>
+              <button className="block-handle-menu-item" onClick={handleDuplicate} type="button">
+                <div className="block-handle-menu-icon"><CopyPlus size={14} strokeWidth={2} /></div>
+                <span>Duplicate</span>
+              </button>
+              <button className="block-handle-menu-item" onClick={handleCopy} type="button">
+                <div className="block-handle-menu-icon">
+                  {copied ? <Check size={14} strokeWidth={2} /> : <Copy size={14} strokeWidth={2} />}
+                </div>
+                <span>{copied ? 'Copied' : 'Copy'}</span>
+              </button>
+              <button className="block-handle-menu-item destructive" onClick={handleDelete} type="button">
+                <div className="block-handle-menu-icon"><Trash2 size={14} strokeWidth={2} /></div>
+                <span>Delete</span>
+              </button>
+            </div>
           </div>
-          <div className="block-handle-menu-sep" />
-          <div className="block-handle-menu-group">
-            <div className="block-handle-menu-section">Actions</div>
-            <button className="block-handle-menu-item" onClick={handleDuplicate} type="button">
-              <div className="block-handle-menu-icon"><CopyPlus size={14} strokeWidth={2} /></div>
-              <span>Duplicate</span>
-            </button>
-            <button className="block-handle-menu-item" onClick={handleCopy} type="button">
-              <div className="block-handle-menu-icon">
-                {copied ? <Check size={14} strokeWidth={2} /> : <Copy size={14} strokeWidth={2} />}
-              </div>
-              <span>{copied ? 'Copied' : 'Copy'}</span>
-            </button>
-            <button className="block-handle-menu-item destructive" onClick={handleDelete} type="button">
-              <div className="block-handle-menu-icon"><Trash2 size={14} strokeWidth={2} /></div>
-              <span>Delete</span>
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
     </>,
     document.body
   )
@@ -1081,6 +1271,63 @@ function CursorOverlay({ editor, provider }: { editor: any; provider: any }) {
   )
 }
 
+// ── AIEditBar — slim bar anchored above the selection, streaming + done states ──
+const AI_STATUS_CYCLE = ['Computing…', 'Writing…', 'Finishing…']
+
+interface AIEditBoxProps {
+  phase: 'prompt' | 'streaming' | 'done'
+  position: { top: number; left: number }
+  onSubmit: (promptText: string) => void
+  onUndo: () => void
+  onInsert: () => void
+  onChatMore: () => void
+  onCancel: () => void
+}
+
+function AIEditBox({ phase, position, onUndo, onInsert, onChatMore, onCancel }: AIEditBoxProps) {
+  const [statusIdx, setStatusIdx] = useState(0)
+
+  useEffect(() => {
+    if (phase !== 'streaming') { setStatusIdx(0); return }
+    const interval = setInterval(() => {
+      setStatusIdx(i => (i + 1) % AI_STATUS_CYCLE.length)
+    }, 900)
+    return () => clearInterval(interval)
+  }, [phase])
+
+  // Only show for streaming / done — prompt phase is now handled inside FloatingToolbar
+  if (phase === 'prompt') return null
+
+  return createPortal(
+    <div
+      className={`ai-result-bar ai-result-bar--${phase}`}
+      style={{ top: position.top, left: position.left }}
+      onMouseDown={e => e.stopPropagation()}
+    >
+      {phase === 'streaming' && (
+        <>
+          <span className="ai-result-bar-spinner" />
+          <span className="ai-result-bar-label">{AI_STATUS_CYCLE[statusIdx]}</span>
+          <button className="ai-result-bar-cancel" onMouseDown={e => { e.preventDefault(); onCancel() }} type="button" title="Cancel">
+            <X size={11} strokeWidth={2.5} />
+          </button>
+        </>
+      )}
+      {phase === 'done' && (
+        <>
+          <span className="ai-result-bar-done-label">Done</span>
+          <div className="ai-result-bar-sep" />
+          <button className="ai-result-bar-action" onMouseDown={e => { e.preventDefault(); onUndo() }} type="button">Undo</button>
+          <div className="ai-result-bar-sep" />
+          <button className="ai-result-bar-action" onMouseDown={e => { e.preventDefault(); onInsert() }} type="button">Keep &amp; insert</button>
+          <button className="ai-result-bar-action ai-result-bar-action--primary" onMouseDown={e => { e.preventDefault(); onChatMore() }} type="button">Chat more</button>
+        </>
+      )}
+    </div>,
+    document.body
+  )
+}
+
 // ── Agent Panel ──────────────────────────────────────────────────────
 
 
@@ -1093,16 +1340,16 @@ interface DropdownOption<T extends string> {
   value: T
   label: string
   description: string
-  icon: (props: { size?: number; strokeWidth?: number; className?: string }) => JSX.Element | null
+  icon: ComponentType<{ size?: number; strokeWidth?: number; className?: string }>
   modeColor?: string
 }
 
 const PANEL_TASK_OPTIONS: Array<DropdownOption<AgentTaskMode>> = [
-  { value: 'auto',      label: 'Auto',      description: 'Infer the job from the instruction.',     icon: Sparkles, modeColor: 'var(--agent-mode-auto-text)' },
-  { value: 'review',    label: 'Review',    description: 'Find clarity, logic, and structure issues.', icon: Sparkles, modeColor: 'var(--agent-mode-review-text)' },
-  { value: 'expand',    label: 'Expand',    description: 'Add depth, examples, or explanation.',    icon: Sparkles, modeColor: 'var(--agent-mode-expand-text)' },
-  { value: 'proofread', label: 'Proofread', description: 'Catch grammar and punctuation issues.',   icon: Sparkles, modeColor: 'var(--agent-mode-proofread-text)' },
-  { value: 'summarize', label: 'Summarize', description: 'Create a concise standalone summary.',    icon: Sparkles, modeColor: 'var(--agent-mode-summarize-text)' },
+  { value: 'auto', label: 'Auto', description: 'Infer the job from the instruction.', icon: Sparkles, modeColor: 'var(--agent-mode-auto-text)' },
+  { value: 'review', label: 'Review', description: 'Find clarity, logic, and structure issues.', icon: Sparkles, modeColor: 'var(--agent-mode-review-text)' },
+  { value: 'expand', label: 'Expand', description: 'Add depth, examples, or explanation.', icon: Sparkles, modeColor: 'var(--agent-mode-expand-text)' },
+  { value: 'proofread', label: 'Proofread', description: 'Catch grammar and punctuation issues.', icon: Sparkles, modeColor: 'var(--agent-mode-proofread-text)' },
+  { value: 'summarize', label: 'Summarize', description: 'Create a concise standalone summary.', icon: Sparkles, modeColor: 'var(--agent-mode-summarize-text)' },
 ]
 
 const PANEL_EFFORT_OPTIONS: Array<DropdownOption<AgentEffortMode>> = [
@@ -1167,6 +1414,7 @@ function PanelInlineDropdown<T extends string>({
 interface AgentTurn {
   role: 'user' | 'agent'
   task?: string
+  displayTask?: string
   mode?: string
   effort?: string
   timestamp: number
@@ -1174,6 +1422,8 @@ interface AgentTurn {
   state?: string
   result?: string | null
   error?: string | null
+  contextText?: string
+  contextLabel?: string
 }
 
 interface AgentPanelProps {
@@ -1184,11 +1434,22 @@ interface AgentPanelProps {
   onUnseenChange: (n: number) => void
   incomingJob: { job_id: string; type: 'complete' | 'failed'; error?: string } | null
   onIncomingJobConsumed: () => void
+  initialContext: {
+    prompt: string
+    selectedText: string
+    aiResult: string
+    selectionFrom: number
+    selectionTo: number
+    resultFrom: number
+    resultTo: number
+  } | null
+  onInitialContextConsumed: () => void
 }
 
 function AgentPanel({
   roomId, editor, panelMode, onPanelModeChange, onUnseenChange,
   incomingJob, onIncomingJobConsumed,
+  initialContext, onInitialContextConsumed,
 }: AgentPanelProps) {
   const [turns, setTurns] = useState<AgentTurn[]>([])
   const [seenTurnIds, setSeenTurnIds] = useState<Set<string>>(new Set())
@@ -1208,6 +1469,77 @@ function AgentPanel({
       if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight
     })
   }, [])
+
+  const [expandedContextIds, setExpandedContextIds] = useState<Set<number>>(new Set())
+
+  // Context card attached to the composer — populated by "Chat more →".
+  // Sits above the textarea until the user dismisses it or sends a message.
+  const [pendingContext, setPendingContext] = useState<{
+    prompt: string
+    selectedText: string
+    aiResult: string
+    selectionFrom: number
+    selectionTo: number
+    resultFrom: number
+    resultTo: number
+  } | null>(null)
+  const [pendingContextVisible, setPendingContextVisible] = useState(false)
+  const pendingContextHighlightsOwned = useRef(false)
+
+  // When initialContext arrives, surface it as a draft card on the composer
+  // (do NOT auto-submit) and focus the textarea so the user can type.
+  useEffect(() => {
+    if (!initialContext) return
+    setPendingContext(initialContext)
+    setPendingContextVisible(false)
+    pendingContextHighlightsOwned.current = false
+    onInitialContextConsumed()
+    setTimeout(() => textareaRef.current?.focus(), 0)
+  }, [initialContext])
+
+  // Keep stable refs to avoid stale closures in the visibility effect
+  const pendingContextRef = useRef(pendingContext)
+  useEffect(() => { pendingContextRef.current = pendingContext }, [pendingContext])
+  const editorRef2 = useRef(editor)
+  useEffect(() => { editorRef2.current = editor }, [editor])
+
+  const clearPendingContextHighlights = useCallback(() => {
+    const ed = editorRef2.current
+    if (!ed) return
+    const tr = ed.state.tr
+      .setMeta(selLockKey, null)
+      .setMeta(aiDecoKey, null)
+    ed.view.dispatch(tr)
+  }, [])
+
+  const showPendingContextHighlights = useCallback(() => {
+    const ed = editorRef2.current
+    const ctx = pendingContextRef.current
+    if (!ed || !ctx) return
+    const tr = ed.state.tr
+      .setMeta(selLockKey, { from: ctx.selectionFrom, to: ctx.selectionTo })
+      .setMeta(aiDecoKey, { from: ctx.resultFrom, to: ctx.resultTo })
+    ed.view.dispatch(tr)
+    pendingContextHighlightsOwned.current = true
+  }, [])
+
+  useEffect(() => {
+    if (pendingContextVisible && pendingContextRef.current) {
+      showPendingContextHighlights()
+      return
+    }
+    if (pendingContextHighlightsOwned.current) {
+      clearPendingContextHighlights()
+      pendingContextHighlightsOwned.current = false
+    }
+  }, [pendingContextVisible, showPendingContextHighlights, clearPendingContextHighlights])
+
+  useEffect(() => () => {
+    if (pendingContextHighlightsOwned.current) {
+      clearPendingContextHighlights()
+      pendingContextHighlightsOwned.current = false
+    }
+  }, [clearPendingContextHighlights])
 
   // Load history on mount — build turns from completed jobs
   useEffect(() => {
@@ -1255,8 +1587,8 @@ function AgentPanel({
             return next
           }
           return [...prev,
-            { role: 'user', task: job.task, mode: job.mode, timestamp: job.created_at, jobId: job.id },
-            { role: 'agent', jobId: job.id, state: job.current_state, result: job.result, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode },
+          { role: 'user', task: job.task, mode: job.mode, timestamp: job.created_at, jobId: job.id },
+          { role: 'agent', jobId: job.id, state: job.current_state, result: job.result, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode },
           ]
         })
         setSubmitting(false)
@@ -1291,15 +1623,26 @@ function AgentPanel({
   }, [composerPrompt])
 
   const handleSubmit = async () => {
-    const task = composerPrompt.trim()
-    if (!task || submitting) return
+    const userPrompt = composerPrompt.trim()
+    if (!userPrompt || submitting) return
+    const ctx = pendingContext
+    // When a context card is attached, prepend a structured context block so
+    // the agent has the original selection + previous AI result.
+    const task = ctx
+      ? `<context>\n  <selected_text>${ctx.selectedText}</selected_text>\n  <previous_ai_result>${ctx.aiResult}</previous_ai_result>\n  <previous_instruction>${ctx.prompt}</previous_instruction>\n</context>\n\n${userPrompt}`
+      : userPrompt
     setComposerPrompt('')
+    setPendingContext(null)
+    setPendingContextVisible(false)
     setSubmitting(true)
     const now = Date.now()
     const tempId = `pending-${now}`
     setTurns(prev => [
       ...prev,
-      { role: 'user', task, mode: composerMode, effort: composerEffort, timestamp: now, jobId: tempId },
+      {
+        role: 'user', task, displayTask: userPrompt, mode: composerMode, effort: composerEffort, timestamp: now, jobId: tempId,
+        contextText: ctx?.selectedText, contextLabel: ctx?.prompt,
+      },
       { role: 'agent', jobId: tempId, state: 'pending', result: null, error: null, timestamp: now + 1, mode: composerMode },
     ])
     scrollToBottom()
@@ -1360,9 +1703,9 @@ function AgentPanel({
               title={panelMode === 'full' ? 'Collapse' : 'Expand'}
             >
               {panelMode === 'full' ? (
-                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" /></svg>
               ) : (
-                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" /></svg>
               )}
             </button>
             <button
@@ -1384,10 +1727,39 @@ function AgentPanel({
           )}
           {turns.map((turn, i) => {
             if (turn.role === 'user') {
+              const isExpanded = expandedContextIds.has(i)
               return (
                 <div key={i} className="agent-turn agent-turn--user">
+                  {turn.contextText && (
+                    <button
+                      className={`agent-turn-context-pill${isExpanded ? ' expanded' : ''}`}
+                      onClick={() => setExpandedContextIds(prev => {
+                        const next = new Set(prev)
+                        isExpanded ? next.delete(i) : next.add(i)
+                        return next
+                      })}
+                      type="button"
+                    >
+                      <span className="agent-turn-context-copy">
+                        <span className="agent-turn-context-title">Inline edit context</span>
+                        {turn.contextLabel && (
+                          <span className="agent-turn-context-subtitle">{turn.contextLabel}</span>
+                        )}
+                      </span>
+                      <span className="agent-turn-context-toggle">
+                        {isExpanded ? 'Hide context' : 'Show context'}
+                        <ChevronDown size={11} strokeWidth={2.5} className="agent-turn-context-chevron" />
+                      </span>
+                      {isExpanded && (
+                        <span className="agent-turn-context-body">
+                          <span className="agent-turn-context-body-label">Selection</span>
+                          <span className="agent-turn-context-body-text">{turn.contextText}</span>
+                        </span>
+                      )}
+                    </button>
+                  )}
                   <div className="agent-turn-bubble">
-                    <span className="agent-turn-task">{turn.task}</span>
+                    <span className="agent-turn-task">{turn.displayTask ?? turn.task}</span>
                     <div className="agent-turn-meta">
                       <span
                         className={`agent-turn-mode-bar agent-turn-mode-bar--${turn.mode ?? 'auto'}`}
@@ -1478,10 +1850,45 @@ function AgentPanel({
         {/* Composer footer */}
         <div className="agent-composer" onClick={() => setOpenDropdown(null)}>
           <div className="agent-composer-card" onClick={e => e.stopPropagation()}>
+            {pendingContext && (
+              <div className="agent-composer-context">
+                <div className="agent-composer-context-head">
+                  <div className="agent-composer-context-head-copy">
+                    <span className="agent-composer-context-eyebrow">
+                      From inline edit
+                    </span>
+                    <span className="agent-composer-context-title">{pendingContext.prompt}</span>
+                  </div>
+                  <div className="agent-composer-context-actions">
+                    <button
+                      className={`agent-composer-context-toggle${pendingContextVisible ? ' expanded' : ''}`}
+                      onClick={() => setPendingContextVisible(v => !v)}
+                      type="button"
+                    >
+                      {pendingContextVisible ? 'Hide changes' : 'Show changes'}
+                    </button>
+                    <button
+                      className="agent-composer-context-dismiss"
+                      onClick={() => {
+                        setPendingContext(null)
+                        setPendingContextVisible(false)
+                      }}
+                      type="button"
+                      title="Dismiss context"
+                    >
+                      <X size={12} strokeWidth={2.2} />
+                    </button>
+                  </div>
+                </div>
+                <span className="agent-composer-context-note">
+                  {pendingContextVisible ? 'Selection and generated text are highlighted in the document.' : 'Use show changes to preview the edit in the document.'}
+                </span>
+              </div>
+            )}
             <textarea
               ref={textareaRef}
               className="agent-composer-textarea"
-              placeholder="Ask the agent…"
+              placeholder={pendingContext ? 'Ask a follow-up about this edit…' : 'Ask the agent…'}
               value={composerPrompt}
               onChange={e => setComposerPrompt(e.target.value)}
               onKeyDown={e => {
@@ -1531,6 +1938,9 @@ function AgentPanel({
   )
 }
 
+const blockIdPluginKey = new PluginKey('blockId')
+const BLOCK_TYPES = ['paragraph', 'heading', 'blockquote', 'listItem', 'taskItem']
+
 // ── App ──────────────────────────────────────────────────────────────
 export default function Document() {
   const { user } = useAuth()
@@ -1557,7 +1967,7 @@ export default function Document() {
   const [theme, setTheme] = useState<'dark' | 'light' | 'system'>(() => {
     return (localStorage.getItem('cowrite-theme') as 'dark' | 'light' | 'system') || 'system'
   })
-  const [resolvedTheme, setResolvedTheme] = useState<'dark' | 'light'>(() => {
+  const [, setResolvedTheme] = useState<'dark' | 'light'>(() => {
     const saved = localStorage.getItem('cowrite-theme') as string
     if (saved === 'dark' || saved === 'light') return saved
     return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
@@ -1565,6 +1975,8 @@ export default function Document() {
   const userName = user?.name ?? ''
 
   const [words, setWords] = useState(0)
+  const [characters, setCharacters] = useState(0)
+  const [selectionStat, setSelectionStat] = useState<{ count: number; label: string } | null>(null)
   const [inTable, setInTable] = useState(false)
 
   const defaultPrefs: Required<DocPrefs> = (() => {
@@ -1629,6 +2041,27 @@ export default function Document() {
   const [incomingJob, setIncomingJob] = useState<{ job_id: string; type: 'complete' | 'failed'; error?: string } | null>(null)
   const [agentPanelMode, setAgentPanelMode] = useState<PanelMode>('hidden')
   const [agentUnseenCount, setAgentUnseenCount] = useState(0)
+
+  const [aiEditOpen, setAiEditOpen] = useState(false)
+  const [aiEditPos, setAiEditPos] = useState({ top: 0, left: 0 })
+  const [aiEditPhase, setAiEditPhase] = useState<'prompt' | 'streaming' | 'done'>('prompt')
+  const aiEditContextRef = useRef<{
+    selectedText: string
+    from: number
+    to: number
+    insertedFrom: number
+    insertedTo: number
+  } | null>(null)
+  const [agentInitialContext, setAgentInitialContext] = useState<{
+    prompt: string
+    selectedText: string
+    aiResult: string
+    selectionFrom: number
+    selectionTo: number
+    resultFrom: number
+    resultTo: number
+  } | null>(null)
+  const aiEditPromptRef = useRef('')
 
   useEffect(() => {
     if (!shareOpen) return
@@ -1777,7 +2210,6 @@ export default function Document() {
       status: 'active', anchor: insertPos, lastActive: Date.now(),
     })
 
-    // Use pre-captured text (avoids stale read after deleteRange)
     const fullText = capturedText?.fullText ?? ed.getText()
     const cursorOffset = capturedText?.cursorOffset ?? ed.state.doc.textBetween(0, insertPos, '\n').length
     const before = mode === 'summarize'
@@ -1790,31 +2222,43 @@ export default function Document() {
     setAiStreaming(true)
 
     let currentPos = insertPos
+    let tokenBuffer = ''
+    let flushScheduled = false
+
+    const flushBuffer = () => {
+      if (!tokenBuffer || ed.isDestroyed) return
+      const chunk = tokenBuffer
+      tokenBuffer = ''
+      flushScheduled = false
+      ed.chain().insertContentAt(currentPos, chunk).run()
+      currentPos = ed.state.selection.from
+      provider.awareness.setLocalStateField('aiPresence', {
+        name: 'Claude', color: '#cd6425', isAI: true,
+        status: 'active', anchor: currentPos, lastActive: Date.now(),
+      })
+    }
+
     await streamAIContent(
       roomId, promptText, before, after, mode,
       (token) => {
-        ed.chain().insertContentAt(currentPos, token).run()
-        currentPos = ed.state.selection.from
-        provider.awareness.setLocalStateField('aiPresence', {
-          name: 'Claude', color: '#cd6425', isAI: true,
-          status: 'active', anchor: currentPos, lastActive: Date.now(),
-        })
+        tokenBuffer += token
+        if (!flushScheduled) {
+          flushScheduled = true
+          requestAnimationFrame(flushBuffer)
+        }
       },
       () => {
-        // Post-process: replace raw text with properly formatted paragraphs
+        flushBuffer()
         if (currentPos > insertPos) {
           const rawText = ed.state.doc.textBetween(insertPos, currentPos, '\n')
-          // Only reformat if there are paragraph breaks
           if (rawText.includes('\n\n')) {
             ed.chain().deleteRange({ from: insertPos, to: currentPos }).run()
             const content = convertTextToContent(rawText)
             ed.chain().insertContentAt(insertPos, content).run()
             currentPos = ed.state.selection.from
           }
-          // Apply fade-out highlight over the inserted range
           const decoTr = ed.state.tr.setMeta(aiDecoKey, { from: insertPos, to: currentPos })
           ed.view.dispatch(decoTr)
-          // Clear decorations after the CSS fade animation finishes (3s)
           setTimeout(() => {
             if (!ed.isDestroyed) {
               const clearTr = ed.state.tr.setMeta(aiDecoKey, null)
@@ -1835,16 +2279,193 @@ export default function Document() {
     )
   }, [aiStreaming, roomId, provider])
 
+  const triggerAIEditCommand = useCallback(async (
+    promptText: string,
+    selectedText: string,
+    from: number,
+    to: number,
+  ) => {
+    const ed = editorRef.current
+    if (!ed || !roomId || aiStreaming) return
+
+    // Insert a newline after the selection so AI output starts on its own line,
+    // and re-apply selLockKey over the selection in the same transaction so the
+    // highlight survives the focus change to the result bar.
+    const insertTr = ed.state.tr
+      .insertText('\n', to)
+      .setMeta(selLockKey, { from, to })
+    ed.view.dispatch(insertTr)
+    const insertPos = to + 1
+    // insertedFrom = to (includes the \n) so undo removes the newline too
+    aiEditContextRef.current = { selectedText, from, to, insertedFrom: to, insertedTo: insertPos }
+
+    // Position bar — defer coord reads so they don't block the paint after flushSync
+    requestAnimationFrame(() => {
+      try {
+        const fromCoords = ed.view.coordsAtPos(from)
+        setAiEditPos({ top: fromCoords.top - 44, left: fromCoords.left })
+      } catch { }
+    })
+    setAiEditOpen(true)
+    setAiEditPhase('streaming')
+    setAiStreaming(true)
+
+    // Use textBetween directly — avoids ProseMirror position vs getText() offset mismatch
+    const docSize = ed.state.doc.content.size
+    const before = ed.state.doc.textBetween(0, from, '\n')
+    const after = ed.state.doc.textBetween(to, Math.min(docSize, to + 4000), '\n')
+
+    let currentPos = insertPos
+    let tokenBuffer = ''
+    let flushScheduled = false
+
+    const flushBuffer = () => {
+      if (!tokenBuffer || ed.isDestroyed) return
+      const chunk = tokenBuffer
+      tokenBuffer = ''
+      flushScheduled = false
+      ed.chain().insertContentAt(currentPos, chunk).run()
+      currentPos = ed.state.selection.from
+      provider.awareness.setLocalStateField('aiPresence', {
+        name: 'Claude', color: '#cd6425', isAI: true,
+        status: 'active', anchor: currentPos, lastActive: Date.now(),
+      })
+    }
+
+    await streamAIContent(
+      roomId, promptText, before, after, 'rewrite',
+      (token) => {
+        tokenBuffer += token
+        if (!flushScheduled) {
+          flushScheduled = true
+          requestAnimationFrame(flushBuffer)
+        }
+      },
+      () => {
+        flushBuffer()
+        if (currentPos > insertPos) {
+          const rawText = ed.state.doc.textBetween(insertPos, currentPos, '\n')
+          if (rawText.includes('\n\n')) {
+            ed.chain().deleteRange({ from: insertPos, to: currentPos }).run()
+            const content = convertTextToContent(rawText)
+            ed.chain().insertContentAt(insertPos, content).run()
+            currentPos = ed.state.selection.from
+          }
+          const ctx2 = aiEditContextRef.current
+          if (ctx2) ctx2.insertedTo = currentPos
+          const decoTr = ed.state.tr
+            .setMeta(aiDecoKey, { from: insertPos, to: currentPos })
+            .setMeta(selLockKey, { from: ctx2!.from, to: ctx2!.to })
+          ed.view.dispatch(decoTr)
+        }
+        setAiEditPhase('done')
+        setAiStreaming(false)
+        provider.awareness.setLocalStateField('aiPresence', null)
+      },
+      (err) => {
+        console.error('AI error:', err)
+        setAiError(err.message || 'AI request failed')
+        setAiStreaming(false)
+        provider.awareness.setLocalStateField('aiPresence', null)
+        setTimeout(() => setAiError(null), 5000)
+      },
+      selectedText,
+    )
+  }, [aiStreaming, roomId, provider])
+
   const slashExtension = useRef(
-    makeSlashExtension(suggestionPropsRef, handleSlashOpenOrUpdate, handleSlashClose)
+    makeSlashExtension(
+      suggestionPropsRef,
+      handleSlashOpenOrUpdate,
+      handleSlashClose,
+      () => editorRef.current?.state.selection.empty === false,
+    )
   ).current
+
+  const openAIEditBox = useCallback((ctx: { selectedText: string; from: number; to: number } | null, _pos: { top: number; left: number }) => {
+    const ed = editorRef.current
+    if (!ed) return
+    if (ctx) {
+      aiEditContextRef.current = { selectedText: ctx.selectedText, from: ctx.from, to: ctx.to, insertedFrom: ctx.to, insertedTo: ctx.to }
+      // Bar appears just above the start of the selection
+      const fromCoords = ed.view.coordsAtPos(ctx.from)
+      const toCoords = ed.view.coordsAtPos(ctx.to)
+      setAiEditPos({ top: Math.min(fromCoords.top, toCoords.top) - 44, left: fromCoords.left })
+    } else {
+      const insertPos = ed.state.selection.from
+      aiEditContextRef.current = { selectedText: '', from: insertPos, to: insertPos, insertedFrom: insertPos, insertedTo: insertPos }
+      setAiEditPos(_pos)
+    }
+    setAiEditPhase('prompt')
+    setAiEditOpen(true)
+  }, [])
+
+  const updateSelectionStat = useCallback((editor: any) => {
+    const { from, to, empty } = editor.state.selection
+    if (empty) {
+      setSelectionStat(null)
+      return
+    }
+    const selectedText = editor.state.doc.textBetween(from, to, '\n', '\n')
+    const selectedWords = countWords(selectedText)
+    const selectedChars = countCharacters(selectedText)
+    if (selectedWords > 0) {
+      setSelectionStat({
+        count: selectedWords,
+        label: selectedWords === 1 ? 'selected word' : 'selected words',
+      })
+      return
+    }
+    setSelectionStat({
+      count: selectedChars,
+      label: selectedChars === 1 ? 'selected char' : 'selected chars',
+    })
+  }, [])
+
+  const BlockIdExtension = Extension.create({
+    name: 'blockId',
+    addProseMirrorPlugins() {
+      return [
+        new Plugin({
+          key: blockIdPluginKey,
+          appendTransaction(transactions, oldState, newState) {
+            const docChanged = transactions.some(tr => tr.docChanged)
+            if (!docChanged) return null
+
+            const isOwnTransaction = transactions.some(tr => tr.getMeta(blockIdPluginKey))
+            if (isOwnTransaction) return null
+            const tr = newState.tr
+            let modified = false
+            const seenIds = new Set<string>()
+            newState.doc.descendants((node, pos) => {
+              if (!BLOCK_TYPES.includes(node.type.name)) return
+
+              if (!node.attrs.blockId || seenIds.has(node.attrs.blockId)) {
+                tr.setNodeMarkup(pos, undefined, { ...node.attrs, blockId: crypto.randomUUID() })
+                modified = true
+                return
+              }
+
+              seenIds.add(node.attrs.blockId)
+            })
+            tr.setMeta(blockIdPluginKey, true)
+
+            return modified ? tr : null
+          }
+        })
+      ]
+    }
+  })
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ history: false, codeBlock: false }),
+      StarterKit.configure({ history: false, codeBlock: false, paragraph: false, heading: false, blockquote: false }),
+      ParagraphWithId,
+      HeadingWithId,
+      BlockquoteWithId,
       Placeholder.configure({ placeholder: "Write something, or type '/' for commands…" }),
       TaskList,
-      TaskItem.configure({ nested: true }),
+      TaskItemWithId,
       TaskListExit,
       CodeBlockLowlight.extend({
         addNodeView() { return ReactNodeViewRenderer(CodeBlockView) },
@@ -1864,18 +2485,35 @@ export default function Document() {
       }),
       slashExtension,
       AI_DECO_EXTENSION,
+      BlockIdExtension
     ],
     onUpdate({ editor }) {
       const text = editor.getText()
       setWords(countWords(text))
+      setCharacters(countCharacters(text))
+      updateSelectionStat(editor)
     },
     onSelectionUpdate({ editor }) {
       setInTable(editor.isActive('table'))
+      updateSelectionStat(editor)
     },
   })
 
   // Keep editorRef in sync so triggerAICommand can access editor without dep ordering issues
   useEffect(() => { editorRef.current = editor }, [editor])
+
+  useEffect(() => {
+    if (editor) (window as any).editor = editor
+  }, [editor])
+
+  useEffect(() => {
+    if (!editor) return
+    const text = editor.getText()
+    setWords(countWords(text))
+    setCharacters(countCharacters(text))
+    updateSelectionStat(editor)
+    setInTable(editor.isActive('table'))
+  }, [editor, updateSelectionStat])
 
   useEffect(() => {
     if (!slashOpen) return
@@ -1994,6 +2632,52 @@ export default function Document() {
       yTitle.delete(0, yTitle.length)
       yTitle.insert(0, newValue)
     })
+  }
+
+  const clearAIDecorations = () => {
+    if (!editor) return
+    const tr = editor.state.tr
+      .setMeta(aiDecoKey, null)
+      .setMeta(selLockKey, null)
+    editor.view.dispatch(tr)
+  }
+
+  const handleAIEditUndo = () => {
+    const ctx = aiEditContextRef.current
+    if (!ctx || !editor) return
+    // Single atomic transaction: delete AI text + clear both decorations
+    const tr = editor.state.tr
+      .deleteRange(ctx.insertedFrom, ctx.insertedTo)
+      .setMeta(aiDecoKey, null)
+      .setMeta(selLockKey, null)
+    editor.view.dispatch(tr)
+    setAiEditOpen(false)
+    aiEditContextRef.current = null
+  }
+
+  const handleAIEditInsert = () => {
+    clearAIDecorations()
+    setAiEditOpen(false)
+    aiEditContextRef.current = null
+  }
+
+  const handleAIEditChatMore = () => {
+    const ctx = aiEditContextRef.current
+    if (!ctx || !editor) return
+    const aiResult = editor.state.doc.textBetween(ctx.insertedFrom, ctx.insertedTo, '\n')
+    clearAIDecorations()
+    setAiEditOpen(false)
+    aiEditContextRef.current = null
+    setAgentInitialContext({
+      prompt: aiEditPromptRef.current,
+      selectedText: ctx.selectedText,
+      aiResult,
+      selectionFrom: ctx.from,
+      selectionTo: ctx.to,
+      resultFrom: ctx.insertedFrom,
+      resultTo: ctx.insertedTo,
+    })
+    setAgentPanelMode('side')
   }
 
   return (
@@ -2187,22 +2871,13 @@ export default function Document() {
               )}
             </div>
 
-            {words > 0 && (
-              <div className="topbar-stats">
-                <span className="topbar-stat-num">{words.toLocaleString()}</span>
-                <span className="topbar-stat-unit">{words === 1 ? 'word' : 'words'}</span>
-                <span className="topbar-stat-sep" />
-                <span className="topbar-stat-num">{readingTime(words)}</span>
-              </div>
-            )}
-            <div className="topbar-sep" />
             <button
               className={`topbar-share-btn agent-topbar-btn${agentUnseenCount > 0 ? ' has-results' : ''}${agentPanelMode !== 'hidden' ? ' active' : ''}`}
               onClick={() => setAgentPanelMode(m => m === 'hidden' ? 'side' : 'hidden')}
               title="Agent"
             >
-              CoWrite Agent
-              <span className="agent-topbar-btn-dot" />
+              Agent
+              <span className="agent-new-badge" />
             </button>
             <div className="settings-wrap" ref={settingsRef}>
               <button className="topbar-menu-btn" onClick={() => setSettingsOpen(o => !o)} title="Settings">
@@ -2265,6 +2940,27 @@ export default function Document() {
                       </label>
                     </div>
                   </div>
+                  {words > 0 && (
+                    <div className="settings-stats">
+                      <span className="settings-stats-item">
+                        <span className="settings-stats-num">{words.toLocaleString()}</span>
+                        <span className="settings-stats-label">{words === 1 ? 'word' : 'words'}</span>
+                      </span>
+                      <span className="settings-stats-separator" aria-hidden="true">|</span>
+                      <span className="settings-stats-item">
+                        <span className="settings-stats-num">{readingTime(words)}</span>
+                      </span>
+                      <span className="settings-stats-separator" aria-hidden="true">|</span>
+                      <span className="settings-stats-item">
+                        <span className="settings-stats-num">
+                          {(selectionStat?.count ?? characters).toLocaleString()}
+                        </span>
+                        <span className="settings-stats-label">
+                          {selectionStat?.label ?? (characters === 1 ? 'char' : 'chars')}
+                        </span>
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -2305,13 +3001,38 @@ export default function Document() {
           position={slashPos}
           onSelect={(item: any) => {
             if (item.isAI) {
-              // Capture text BEFORE deleteRange so we don't get a stale/empty read
-              const fullText = editor?.getText() ?? ''
-              const cursorPos = editor ? editor.state.doc.textBetween(0, editor.state.selection.from, '\n').length : 0
               const range = suggestionPropsRef.current?.range
-              if (range) editor?.chain().focus().deleteRange(range).run()
-              setSlashOpen(false)
-              triggerAICommand(item.promptText || '', item.aiMode || 'write', { fullText, cursorOffset: cursorPos })
+              if (item.needsPrompt) {
+                // Capture selection before deleting the slash range
+                const hasSelection = editor && !editor.state.selection.empty
+                const selFrom = editor?.state.selection.from ?? 0
+                const selTo = editor?.state.selection.to ?? 0
+                const selectedText = hasSelection && editor
+                  ? editor.state.doc.textBetween(selFrom, selTo, '\n')
+                  : ''
+                const selCoords = hasSelection && editor ? editor.view.coordsAtPos(selTo) as { top: number; bottom: number; left: number; right: number } : null
+
+                if (range) editor?.chain().focus().deleteRange(range).run()
+                setSlashOpen(false)
+
+                if ((item.isRewrite || (hasSelection && selectedText)) && editor) {
+                  // Rewrite or AI: Write with selection — open edit box anchored below selection
+                  const pos = selCoords
+                    ? { top: selCoords.bottom + 8, left: selCoords.left }
+                    : slashPos
+                  openAIEditBox({ selectedText, from: selFrom, to: selTo }, pos)
+                } else {
+                  // Write mode: no selection context, open prompt box at slash position
+                  openAIEditBox(null, slashPos)
+                }
+              } else {
+                // Continue: stream immediately
+                const fullText = editor?.getText() ?? ''
+                const cursorPos = editor ? editor.state.doc.textBetween(0, editor.state.selection.from, '\n').length : 0
+                if (range) editor?.chain().focus().deleteRange(range).run()
+                setSlashOpen(false)
+                triggerAICommand('', item.aiMode || 'continue', { fullText, cursorOffset: cursorPos })
+              }
             } else {
               suggestionPropsRef.current?.command(item)
               setSlashOpen(false)
@@ -2324,7 +3045,15 @@ export default function Document() {
       {inTable && editor && <TableAlignJustify editor={editor} />}
 
       {/* Floating selection toolbar */}
-      {editor && <FloatingToolbar editor={editor} />}
+      {editor && (
+        <FloatingToolbar
+          editor={editor}
+          onAIEdit={(selectedText, from, to, _pos, promptText) => {
+            aiEditPromptRef.current = promptText
+            triggerAIEditCommand(promptText, selectedText, from, to)
+          }}
+        />
+      )}
 
       {/* Block handle */}
       {editor && <BlockHandle editor={editor} />}
@@ -2342,6 +3071,27 @@ export default function Document() {
           onUnseenChange={setAgentUnseenCount}
           incomingJob={incomingJob}
           onIncomingJobConsumed={() => setIncomingJob(null)}
+          initialContext={agentInitialContext}
+          onInitialContextConsumed={() => setAgentInitialContext(null)}
+        />
+      )}
+
+      {/* AI Edit Box */}
+      {aiEditOpen && (
+        <AIEditBox
+          phase={aiEditPhase}
+          position={aiEditPos}
+          onSubmit={promptText => {
+            aiEditPromptRef.current = promptText
+            const ctx = aiEditContextRef.current
+            if (ctx) {
+              triggerAIEditCommand(promptText, ctx.selectedText, ctx.from, ctx.to)
+            }
+          }}
+          onUndo={handleAIEditUndo}
+          onInsert={handleAIEditInsert}
+          onChatMore={handleAIEditChatMore}
+          onCancel={() => setAiEditOpen(false)}
         />
       )}
 
