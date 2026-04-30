@@ -56,18 +56,70 @@ async function mapChunks(chunks, mode, task, anthropic, model) {
     }))
 }
 
+function getOpKey(op) {
+    if (op.op === 'replace_text') {
+        return `${op.op}|${op.blockId}|${op.oldText}|${op.newText}`
+    }
+
+    if (op.op === 'insert_block_after') {
+        return `${op.op}|${op.afterBlockId}|${op.text}`
+    }
+
+    return JSON.stringify(op)
+}
+
 async function reduceResults(results, mode, task, anthropic, model) {
     if (mode === 'proofread' || mode === 'expand' || mode === 'auto') {
         // concatenate op arrays
+        const allOps = []
+
+        for (const result of results) {
+            const ops = JSON.parse(result)
+
+            for (const op of ops) {
+                allOps.push(op)
+            }
+        }
+
+        return JSON.stringify(allOps)
     }
 
     if (mode === 'summarize') {
         // second Claude call
+        const combined = results.join('\n\n')
+
+        const response = await anthropic.messages.create({
+            model,
+            max_tokens: 1000,
+            system: 'You are a writing assistant. Combine partial summaries into one concise coherent summary. Output only the summary.',
+            messages: [
+                {
+                    role: 'user',
+                    content: `Combine these partial summaries into one concise final summary.
+
+                    Task/context:
+                    ${task || 'Summarize the document.'}
+
+                    Partial summaries:
+                    ${combined}`
+                }
+            ]
+        })
+
+        return response.content[0].text
     }
 
     if (mode === 'review') {
-        // merge and deduplicate
+        const seen = new Set()
+        for (const result of results) {
+            for (const line of result.split('\n')) {
+                if (line.trim()) seen.add(line)
+            }
+        }
+        return [...seen].join('\n')
     }
+
+    return results.join('\n\n')
 }
 
 function isJsonMode(mode) {
