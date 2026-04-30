@@ -260,6 +260,13 @@ function normalizePreviewText(text = '') {
   return text.replace(/\s+/g, ' ').trim().slice(0, PREVIEW_TEXT_LIMIT)
 }
 
+function percentile(values, p) {
+  if (values.length === 0) return 0
+
+  const index = Math.floor((p / 100) * (values.length - 1))
+  return values[index]
+}
+
 function getNodeText(node) {
   if (node instanceof Y.XmlText) {
     return node.toDelta()
@@ -711,7 +718,7 @@ const server = http.createServer(async (req, res) => {
               const text = getNodeText(element)
               if (blockId) {
                 blocks.push({
-                  id: blockId,
+                  blockId,
                   type: element.nodeName,
                   text: typeof text === 'string' ? text : JSON.stringify(text)
                 })
@@ -742,211 +749,262 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'GET' && url.pathname === '/admin/agent-stats') {
+    try {
+      const latency = db.prepare(`
+      SELECT * FROM agent_jobs 
+      WHERE current_state = 'done' 
+        AND finished_at IS NOT NULL 
+        AND started_at IS NOT NULL
+    `)
+
+      const jobs = latency.all()
+      const latencies = jobs.map(j => j.finished_at - j.started_at).sort((a, b) => a - b)
+
+      const p50 = percentile(latencies, 50)
+      const p95 = percentile(latencies, 95)
+
+      const totalJobs = db.prepare('SELECT COUNT(*) as count FROM agent_jobs').get().count
+      const successRate = totalJobs === 0 ? 0 : jobs.length / totalJobs
+      const estimatedCost = jobs.reduce((sum, j) => sum + (j.output_tokens ?? 0), 0) * 0.000003
+      const byMode = {}
+      const grouped = jobs.reduce((acc, job) => {
+        const key = job.mode ?? 'unknown'
+        if (!acc[key]) acc[key] = []
+        acc[key].push(job)
+        return acc
+      }, {})
+
+      for (const [mode, modeJobs] of Object.entries(grouped)) {
+        const modeLatencies = modeJobs.map(j => j.finished_at - j.started_at).sort((a, b) => a - b)
+        byMode[mode] = {
+          count: modeJobs.length,
+          avg_output_tokens: Math.round(modeJobs.reduce((sum, j) => sum + (j.output_tokens ?? 0), 0) / modeJobs.length),
+          p50_ms: percentile(modeLatencies, 50),
+          p95_ms: percentile(modeLatencies, 95),
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        total_jobs: totalJobs,
+        success_rate: successRate,
+        p50_ms: p50,
+        p95_ms: p95,
+        estimated_cost_usd: estimatedCost,
+        by_mode: byMode,
+      }))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Server error' }))
+    }
+    return
+  }
+
   // DELETE /documents/:room/share/:targetUserId
   if (req.method === 'DELETE' && url.pathname.match(/^\/documents\/[^/]+\/share\/[^/]+$/)) {
-    const parts = url.pathname.split('/')
-    const room = parts[2]
-    const targetUserId = parts[4]
+  const parts = url.pathname.split('/')
+  const room = parts[2]
+  const targetUserId = parts[4]
+  try {
+    const result = deleteShare.run(room, userId, targetUserId)
+    if (result.changes === 0) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Not authorized or share not found' }))
+      return
+    }
+    kickUserFromRoom(room, targetUserId)
+    ssePush(targetUserId, 'doc:unshared', { room })
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ success: true }))
+  } catch {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error' }))
+  }
+  return
+}
+
+// DELETE /documents/:room
+if (req.method === 'DELETE' && url.pathname.match(/^\/documents\/[^/]+$/) &&
+  !url.pathname.includes('/share') && !url.pathname.includes('/prefs') &&
+  !url.pathname.includes('/title') && !url.pathname.includes('/shares') &&
+  !url.pathname.includes('/ai')) {
+  const room = url.pathname.split('/')[2]
+  try {
+    // Get collaborators before deleting so we can notify them
+    const collaborators = getDocShares.all(room).map(u => u.id)
+    const result = deleteDoc.run(room, userId)
+    if (result.changes === 0) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Not authorized or document not found' }))
+      return
+    }
+    // Kick any collaborators currently in the doc and notify them
+    for (const collabId of collaborators) {
+      kickUserFromRoom(room, collabId)
+      ssePush(collabId, 'doc:deleted', { room })
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ success: true }))
+  } catch {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error' }))
+  }
+  return
+}
+
+// GET /documents/:room/shares
+if (req.method === 'GET' && url.pathname.match(/^\/documents\/[^/]+\/shares$/)) {
+  const room = url.pathname.split('/')[2]
+  try {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(getDocShares.all(room)))
+  } catch {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error' }))
+  }
+  return
+}
+
+// POST /documents/:room/share
+if (req.method === 'POST' && url.pathname.match(/^\/documents\/[^/]+\/share$/)) {
+  const room = url.pathname.split('/')[2]
+  let body = ''
+  req.on('data', chunk => body += chunk)
+  req.on('end', () => {
     try {
-      const result = deleteShare.run(room, userId, targetUserId)
-      if (result.changes === 0) {
-        res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Not authorized or share not found' }))
+      const { shared_with_id } = JSON.parse(body)
+      if (!shared_with_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'shared_with_id required' }))
         return
       }
-      kickUserFromRoom(room, targetUserId)
-      ssePush(targetUserId, 'doc:unshared', { room })
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true }))
-    } catch {
-      res.writeHead(500, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Server error' }))
-    }
-    return
-  }
-
-  // DELETE /documents/:room
-  if (req.method === 'DELETE' && url.pathname.match(/^\/documents\/[^/]+$/) &&
-    !url.pathname.includes('/share') && !url.pathname.includes('/prefs') &&
-    !url.pathname.includes('/title') && !url.pathname.includes('/shares') &&
-    !url.pathname.includes('/ai')) {
-    const room = url.pathname.split('/')[2]
-    try {
-      // Get collaborators before deleting so we can notify them
-      const collaborators = getDocShares.all(room).map(u => u.id)
-      const result = deleteDoc.run(room, userId)
-      if (result.changes === 0) {
-        res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Not authorized or document not found' }))
+      if (userId === shared_with_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Cannot share with yourself' }))
         return
       }
-      // Kick any collaborators currently in the doc and notify them
-      for (const collabId of collaborators) {
-        kickUserFromRoom(room, collabId)
-        ssePush(collabId, 'doc:deleted', { room })
+      const doc = getDocMeta.get(room)
+      if (!doc || doc.owner_id !== userId) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Not authorized' }))
+        return
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true }))
-    } catch {
-      res.writeHead(500, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Server error' }))
-    }
-    return
-  }
-
-  // GET /documents/:room/shares
-  if (req.method === 'GET' && url.pathname.match(/^\/documents\/[^/]+\/shares$/)) {
-    const room = url.pathname.split('/')[2]
-    try {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(getDocShares.all(room)))
-    } catch {
-      res.writeHead(500, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Server error' }))
-    }
-    return
-  }
-
-  // POST /documents/:room/share
-  if (req.method === 'POST' && url.pathname.match(/^\/documents\/[^/]+\/share$/)) {
-    const room = url.pathname.split('/')[2]
-    let body = ''
-    req.on('data', chunk => body += chunk)
-    req.on('end', () => {
-      try {
-        const { shared_with_id } = JSON.parse(body)
-        if (!shared_with_id) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'shared_with_id required' }))
-          return
-        }
-        if (userId === shared_with_id) {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Cannot share with yourself' }))
-          return
-        }
-        const doc = getDocMeta.get(room)
-        if (!doc || doc.owner_id !== userId) {
-          res.writeHead(403, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Not authorized' }))
-          return
-        }
-        insertShare.run(room, userId, shared_with_id, Date.now())
-        // Push the full shared doc to the new collaborator
-        const sharedDoc = db.prepare(`
+      insertShare.run(room, userId, shared_with_id, Date.now())
+      // Push the full shared doc to the new collaborator
+      const sharedDoc = db.prepare(`
           SELECT d.room, d.title, d.updated_at, d.created_at, d.preview_json,
                  u.name AS owner_name, u.color AS owner_color
           FROM documents d JOIN users u ON u.id = d.owner_id
           WHERE d.room = ?
         `).get(room)
-        if (sharedDoc) {
-          const { preview_json, ...rest } = sharedDoc
-          ssePush(shared_with_id, 'doc:shared', {
-            ...rest,
-            preview_blocks: (() => { try { return JSON.parse(preview_json || '[]') } catch { return [] } })(),
-          })
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ success: true }))
-      } catch {
-        res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Server error' }))
+      if (sharedDoc) {
+        const { preview_json, ...rest } = sharedDoc
+        ssePush(shared_with_id, 'doc:shared', {
+          ...rest,
+          preview_blocks: (() => { try { return JSON.parse(preview_json || '[]') } catch { return [] } })(),
+        })
       }
-    })
-    return
-  }
-
-  // PATCH /documents/:room/title
-  if (req.method === 'PATCH' && url.pathname.match(/^\/documents\/[^/]+\/title$/)) {
-    const room = url.pathname.split('/')[2]
-    let body = ''
-    req.on('data', chunk => body += chunk)
-    req.on('end', () => {
-      try {
-        const { title } = JSON.parse(body)
-        if (typeof title !== 'string') {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'title string required' }))
-          return
-        }
-        const result = renameDoc.run(title.trim() || 'Untitled', Date.now(), room, userId)
-        if (result.changes === 0) {
-          res.writeHead(403, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'Not authorized or document not found' }))
-          return
-        }
-        try {
-          const ydoc = getYDoc(room)
-          if (ydoc) {
-            const yTitle = ydoc.getText('title')
-            ydoc.transact(() => {
-              yTitle.delete(0, yTitle.length)
-              yTitle.insert(0, title.trim() || 'Untitled')
-            })
-          }
-        } catch { }
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ success: true }))
-      } catch {
-        res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Server error' }))
-      }
-    })
-    return
-  }
-
-  // GET /documents/:room/prefs
-  if (req.method === 'GET' && url.pathname.match(/^\/documents\/[^/]+\/prefs$/)) {
-    const room = url.pathname.split('/')[2]
-    try {
-      const row = getDocPrefs.get(userId, room)
-      let prefs = {}
-      if (row?.prefs_json) { try { prefs = JSON.parse(row.prefs_json) } catch { prefs = {} } }
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ prefs }))
+      res.end(JSON.stringify({ success: true }))
     } catch {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Server error' }))
     }
-    return
-  }
+  })
+  return
+}
 
-  // PUT /documents/:room/prefs
-  if (req.method === 'PUT' && url.pathname.match(/^\/documents\/[^/]+\/prefs$/)) {
-    const room = url.pathname.split('/')[2]
-    let body = ''
-    req.on('data', chunk => body += chunk)
-    req.on('end', () => {
-      try {
-        const { prefs } = JSON.parse(body)
-        if (!prefs || typeof prefs !== 'object') {
-          res.writeHead(400, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'prefs object required' }))
-          return
-        }
-        upsertDocPrefs.run(userId, room, JSON.stringify(prefs), Date.now())
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ success: true }))
-      } catch {
-        res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Server error' }))
+// PATCH /documents/:room/title
+if (req.method === 'PATCH' && url.pathname.match(/^\/documents\/[^/]+\/title$/)) {
+  const room = url.pathname.split('/')[2]
+  let body = ''
+  req.on('data', chunk => body += chunk)
+  req.on('end', () => {
+    try {
+      const { title } = JSON.parse(body)
+      if (typeof title !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'title string required' }))
+        return
       }
-    })
-    return
-  }
-
-  // POST /documents/:room/ai
-  if (req.method === 'POST' && url.pathname.match(/^\/documents\/[^/]+\/ai$/)) {
-    const room = url.pathname.split('/')[2]
-    let body = ''
-    req.on('data', chunk => body += chunk)
-    req.on('end', async () => {
+      const result = renameDoc.run(title.trim() || 'Untitled', Date.now(), room, userId)
+      if (result.changes === 0) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Not authorized or document not found' }))
+        return
+      }
       try {
-        const { prompt, before, after, mode, selection } = JSON.parse(body)
+        const ydoc = getYDoc(room)
+        if (ydoc) {
+          const yTitle = ydoc.getText('title')
+          ydoc.transact(() => {
+            yTitle.delete(0, yTitle.length)
+            yTitle.insert(0, title.trim() || 'Untitled')
+          })
+        }
+      } catch { }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Server error' }))
+    }
+  })
+  return
+}
 
-        const hasContent = (before || '').trim().length > 0
+// GET /documents/:room/prefs
+if (req.method === 'GET' && url.pathname.match(/^\/documents\/[^/]+\/prefs$/)) {
+  const room = url.pathname.split('/')[2]
+  try {
+    const row = getDocPrefs.get(userId, room)
+    let prefs = {}
+    if (row?.prefs_json) { try { prefs = JSON.parse(row.prefs_json) } catch { prefs = {} } }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ prefs }))
+  } catch {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error' }))
+  }
+  return
+}
 
-        const systemPrompt = `You are a writing assistant embedded inside a collaborative document editor. Your output is inserted directly into the document — write only the content itself, nothing else.
+// PUT /documents/:room/prefs
+if (req.method === 'PUT' && url.pathname.match(/^\/documents\/[^/]+\/prefs$/)) {
+  const room = url.pathname.split('/')[2]
+  let body = ''
+  req.on('data', chunk => body += chunk)
+  req.on('end', () => {
+    try {
+      const { prefs } = JSON.parse(body)
+      if (!prefs || typeof prefs !== 'object') {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'prefs object required' }))
+        return
+      }
+      upsertDocPrefs.run(userId, room, JSON.stringify(prefs), Date.now())
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true }))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Server error' }))
+    }
+  })
+  return
+}
+
+// POST /documents/:room/ai
+if (req.method === 'POST' && url.pathname.match(/^\/documents\/[^/]+\/ai$/)) {
+  const room = url.pathname.split('/')[2]
+  let body = ''
+  req.on('data', chunk => body += chunk)
+  req.on('end', async () => {
+    try {
+      const { prompt, before, after, mode, selection } = JSON.parse(body)
+
+      const hasContent = (before || '').trim().length > 0
+
+      const systemPrompt = `You are a writing assistant embedded inside a collaborative document editor. Your output is inserted directly into the document — write only the content itself, nothing else.
 
 Rules:
 - Match the author's voice, tone, and sentence rhythm exactly.
@@ -955,115 +1013,220 @@ Rules:
 - Do not repeat content already present. Do not introduce yourself.
 - Write substantively — complete thoughts, not filler. The user will accept or reject your output.`
 
-        let userMessage
-        if (mode === 'continue') {
-          if (hasContent) {
-            userMessage = `Continue writing naturally from where this text ends. Match the style and flow exactly. Only output the continuation — nothing else.\n\n<document_before_cursor>\n${before}\n</document_before_cursor>${after ? `\n\n<document_after_cursor>\n${after}\n</document_after_cursor>` : ''}`
-          } else {
-            userMessage = `Start writing a document. Output the opening paragraphs.`
-          }
-        } else if (mode === 'rewrite') {
-          const passage = (selection && selection.trim().length > 0) ? selection : before.slice(-2000)
-          const ctxAfter = (after || '').slice(0, 300)
-          const contextHint = ctxAfter ? `\n\nFor tone/style reference only — do not reproduce: "${ctxAfter.slice(0, 150)}…"` : ''
-          userMessage = `Rewrite the following passage per the instruction. Output only the rewritten passage — no labels, no preamble, nothing else.\n\nInstruction: "${prompt}"\n\nPassage:\n${passage}${contextHint}`
+      let userMessage
+      if (mode === 'continue') {
+        if (hasContent) {
+          userMessage = `Continue writing naturally from where this text ends. Match the style and flow exactly. Only output the continuation — nothing else.\n\n<document_before_cursor>\n${before}\n</document_before_cursor>${after ? `\n\n<document_after_cursor>\n${after}\n</document_after_cursor>` : ''}`
         } else {
-          // write mode — user gave a prompt
-          if (hasContent) {
-            userMessage = `The author is writing a document. Here is what they've written so far:\n\n<document_before_cursor>\n${before}\n</document_before_cursor>${after ? `\n\n<document_after_cursor>\n${after}\n</document_after_cursor>` : ''}\n\nWrite the following at the cursor position: "${prompt}"\n\nOutput only the requested text, written in the author's voice and style.`
-          } else {
-            userMessage = `Write the following for a new document: "${prompt}"\n\nOutput only the text.`
-          }
+          userMessage = `Start writing a document. Output the opening paragraphs.`
         }
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        })
-        const stream = anthropic.messages.stream({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2048,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userMessage }],
-        })
-        stream.on('text', (text) => {
-          res.write(`data: ${JSON.stringify({ token: text })}\n\n`)
-        })
-        stream.on('error', (err) => {
-          console.error('Stream error:', err)
-          res.write(`data: ${JSON.stringify({ error: err.message || 'Stream failed' })}\n\n`)
-          res.end()
-        })
-        await stream.finalMessage()
-        res.write('data: [DONE]\n\n')
-        res.end()
-      } catch (err) {
-        console.error('AI endpoint error:', err)
-        if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'AI request failed' }))
+      } else if (mode === 'rewrite') {
+        const passage = (selection && selection.trim().length > 0) ? selection : before.slice(-2000)
+        const ctxAfter = (after || '').slice(0, 300)
+        const contextHint = ctxAfter ? `\n\nFor tone/style reference only — do not reproduce: "${ctxAfter.slice(0, 150)}…"` : ''
+        userMessage = `Rewrite the following passage per the instruction. Output only the rewritten passage — no labels, no preamble, nothing else.\n\nInstruction: "${prompt}"\n\nPassage:\n${passage}${contextHint}`
+      } else {
+        // write mode — user gave a prompt
+        if (hasContent) {
+          userMessage = `The author is writing a document. Here is what they've written so far:\n\n<document_before_cursor>\n${before}\n</document_before_cursor>${after ? `\n\n<document_after_cursor>\n${after}\n</document_after_cursor>` : ''}\n\nWrite the following at the cursor position: "${prompt}"\n\nOutput only the requested text, written in the author's voice and style.`
+        } else {
+          userMessage = `Write the following for a new document: "${prompt}"\n\nOutput only the text.`
         }
       }
-    })
-    return
-  }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      })
+      const stream = anthropic.messages.stream({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userMessage }],
+      })
+      stream.on('text', (text) => {
+        res.write(`data: ${JSON.stringify({ token: text })}\n\n`)
+      })
+      stream.on('error', (err) => {
+        console.error('Stream error:', err)
+        res.write(`data: ${JSON.stringify({ error: err.message || 'Stream failed' })}\n\n`)
+        res.end()
+      })
+      await stream.finalMessage()
+      res.write('data: [DONE]\n\n')
+      res.end()
+    } catch (err) {
+      console.error('AI endpoint error:', err)
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'AI request failed' }))
+      }
+    }
+  })
+  return
+}
 
-  // GET /jobs/:id — return a single job if owned by this user
-  if (req.method === 'GET' && url.pathname.match(/^\/jobs\/[^/]+$/)) {
-    const jobId = url.pathname.split('/')[2]
+// GET /jobs/:id — return a single job if owned by this user
+if (req.method === 'GET' && url.pathname.match(/^\/jobs\/[^/]+$/)) {
+  const jobId = url.pathname.split('/')[2]
+  try {
+    const job = db.prepare('SELECT * FROM agent_jobs WHERE id = ?').get(jobId)
+    if (!job) {
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Not found' }))
+      return
+    }
+    if (job.owner !== userId) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden' }))
+      return
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(job))
+  } catch {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error' }))
+  }
+  return
+}
+
+// PATCH /jobs/:id/decision
+if (req.method === 'PATCH' && url.pathname.match(/^\/jobs\/[^/]+\/decision$/)) {
+  const jobId = url.pathname.split('/')[2]
+  let body = ''
+  req.on('data', chunk => body += chunk)
+  req.on('end', () => {
     try {
       const job = db.prepare('SELECT * FROM agent_jobs WHERE id = ?').get(jobId)
-      if (!job) {
-        res.writeHead(404, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Not found' }))
+      if (!job) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Not found' })); return }
+      if (job.owner !== userId) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Forbidden' })); return }
+      const { decision } = JSON.parse(body)
+      if (decision !== 'applied' && decision !== 'dismissed') {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'decision must be applied or dismissed' }))
         return
       }
-      if (job.owner !== userId) {
-        res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Forbidden' }))
-        return
-      }
+      db.prepare('UPDATE agent_jobs SET decision = ? WHERE id = ?').run(decision, jobId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(job))
+      res.end(JSON.stringify({ ok: true }))
     } catch {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Server error' }))
     }
-    return
-  }
+  })
+  return
+}
 
-  // GET /jobs?room=:roomId — return last 10 jobs for a room accessible to this user
-  if (req.method === 'GET' && url.pathname === '/jobs') {
-    const room = url.searchParams.get('room')
-    if (!room) {
-      res.writeHead(400, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'room required' }))
+// POST /jobs/:id/validate
+if (req.method === 'POST' && url.pathname.match(/^\/jobs\/[^/]+\/validate$/)) {
+  const jobId = url.pathname.split('/')[2]
+  try {
+    const job = db.prepare('SELECT * FROM agent_jobs WHERE id = ?').get(jobId)
+    if (!job) {
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Not found' }))
       return
     }
-    try {
-      const access = getAccessibleDoc.get(room, userId, userId)
-      if (!access) {
-        res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Forbidden' }))
-        return
+    if (job.owner !== userId) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden' }))
+      return
+    }
+    if (job.current_state !== 'done' || job.result_kind !== 'json') {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Job is not a completed JSON proposal' }))
+      return
+    }
+    if (!job.snapshot_json) {
+      res.writeHead(422, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ valid: false, error: 'No snapshot available for validation' }))
+      return
+    }
+
+    const snapshot = JSON.parse(job.snapshot_json)
+    const proposal = JSON.parse(job.proposal_json)
+
+    // Build lookup map: blockId -> block
+    const snapshotMap = {}
+    for (const block of snapshot) {
+      snapshotMap[block.id] = block
+    }
+
+    const errors = []
+    for (const op of proposal) {
+      if (op.op === 'replace_text') {
+        if (!op.blockId || !op.oldText || !op.newText) {
+          errors.push(`replace_text op missing required fields`)
+          continue
+        }
+        const block = snapshotMap[op.blockId]
+        if (!block) {
+          errors.push(`Block ${op.blockId} not found in snapshot`)
+          continue
+        }
+        if (!block.text.includes(op.oldText)) {
+          errors.push(`Block ${op.blockId}: oldText does not match snapshot content`)
+        }
+      } else if (op.op === 'insert_block_after') {
+        if (!op.afterBlockId || !op.text) {
+          errors.push(`insert_block_after op missing required fields`)
+          continue
+        }
+        if (!snapshotMap[op.afterBlockId]) {
+          errors.push(`Block ${op.afterBlockId} not found in snapshot`)
+        }
+      } else {
+        errors.push(`Unknown op type: ${op.op}`)
       }
-      const jobs = db.prepare(`
+    }
+
+    if (errors.length > 0) {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ valid: false, errors }))
+      return
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ valid: true, op_count: proposal.length }))
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error', detail: err.message }))
+  }
+  return
+}
+
+// GET /jobs?room=:roomId — return last 10 jobs for a room accessible to this user
+if (req.method === 'GET' && url.pathname === '/jobs') {
+  const room = url.searchParams.get('room')
+  if (!room) {
+    res.writeHead(400, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'room required' }))
+    return
+  }
+  try {
+    const access = getAccessibleDoc.get(room, userId, userId)
+    if (!access) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden' }))
+      return
+    }
+    const jobs = db.prepare(`
         SELECT * FROM agent_jobs
         WHERE document_id = ? AND owner = ?
         ORDER BY created_at DESC
         LIMIT 10
       `).all(room, userId)
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(jobs))
-    } catch {
-      res.writeHead(500, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'Server error' }))
-    }
-    return
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(jobs))
+  } catch {
+    res.writeHead(500, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'Server error' }))
   }
+  return
+}
 
-  res.writeHead(200)
-  res.end('CoWrite WebSocket Server')
+res.writeHead(200)
+res.end('CoWrite WebSocket Server')
 })
 
 // SSE connections: userId -> Set<res>

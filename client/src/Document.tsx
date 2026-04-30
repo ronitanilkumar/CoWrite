@@ -22,7 +22,7 @@ import { WebsocketProvider } from 'y-websocket'
 import { useState, useEffect, useRef, useCallback, useMemo, type ComponentType } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from './AuthContext'
-import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, getJobResult, getDocumentJobs, submitAgentJob, type DocPrefs } from './api'
+import { createDocument as createDocumentAPI, getAllUsers, getDocShares, shareDocument, unshareDocument, streamAIContent, getDocPrefs, saveDocPrefs, connectEvents, getJobResult, getDocumentJobs, submitAgentJob, patchJobDecision, fetchAgentStats, type DocPrefs } from './api'
 import { createPortal, flushSync } from 'react-dom'
 import { marked } from 'marked'
 import {
@@ -33,7 +33,7 @@ import {
   Bold, Italic, Strikethrough,
   Copy, Check, ChevronDown,
   GripVertical, Trash2, CopyPlus, Plus,
-  ArrowLeft, ArrowUp, Share2, Link, Search, Sparkles, X, Gauge, MessageCircle,
+  ArrowLeft, ArrowUp, Share2, Link, Search, Sparkles, X, Gauge, MessageCircle, LoaderCircle,
 } from 'lucide-react'
 import './App.css'
 
@@ -1421,6 +1421,10 @@ interface AgentTurn {
   jobId?: string
   state?: string
   result?: string | null
+  result_kind?: string
+  proposal_json?: string | null
+  op_count?: number
+  decision?: 'applied' | 'dismissed'
   error?: string | null
   contextText?: string
   contextLabel?: string
@@ -1432,6 +1436,7 @@ interface AgentPanelProps {
   panelMode: PanelMode
   onPanelModeChange: (m: PanelMode) => void
   onUnseenChange: (n: number) => void
+  onApplyProposal: (jobId: string, proposal: any[]) => void
   incomingJob: { job_id: string; type: 'complete' | 'failed'; error?: string } | null
   onIncomingJobConsumed: () => void
   initialContext: {
@@ -1448,6 +1453,7 @@ interface AgentPanelProps {
 
 function AgentPanel({
   roomId, editor, panelMode, onPanelModeChange, onUnseenChange,
+  onApplyProposal,
   incomingJob, onIncomingJobConsumed,
   initialContext, onInitialContextConsumed,
 }: AgentPanelProps) {
@@ -1461,6 +1467,7 @@ function AgentPanel({
   const [panelError, setPanelError] = useState<string | null>(null)
   const [confirmReplaceJobId, setConfirmReplaceJobId] = useState<string | null>(null)
   const [copiedJobId, setCopiedJobId] = useState<string | null>(null)
+  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(new Set())
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
 
@@ -1548,7 +1555,7 @@ function AgentPanel({
       const newTurns: AgentTurn[] = []
       for (const job of sorted) {
         newTurns.push({ role: 'user', task: job.task, mode: job.mode, effort: job.model_used, timestamp: job.created_at, jobId: job.id })
-        newTurns.push({ role: 'agent', jobId: job.id, state: job.current_state, result: job.result, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode })
+        newTurns.push({ role: 'agent', jobId: job.id, state: job.current_state, result: job.result, result_kind: job.result_kind ?? undefined, proposal_json: job.proposal_json, decision: job.decision ?? undefined, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode })
       }
       setTurns(newTurns)
       scrollToBottom()
@@ -1583,21 +1590,23 @@ function AgentPanel({
           const idx = prev.findIndex(t => t.role === 'agent' && t.jobId === job.id)
           if (idx !== -1) {
             const next = [...prev]
-            next[idx] = { ...next[idx], state: job.current_state, result: job.result, error: job.error_msg }
+            next[idx] = { ...next[idx], state: job.current_state, result: job.result, result_kind: job.result_kind ?? undefined, proposal_json: job.proposal_json, decision: job.decision ?? undefined, error: job.error_msg }
             return next
           }
           return [...prev,
           { role: 'user', task: job.task, mode: job.mode, timestamp: job.created_at, jobId: job.id },
-          { role: 'agent', jobId: job.id, state: job.current_state, result: job.result, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode },
+          { role: 'agent', jobId: job.id, state: job.current_state, result: job.result, result_kind: job.result_kind ?? undefined, proposal_json: job.proposal_json, decision: job.decision ?? undefined, error: job.error_msg, timestamp: job.created_at + 1, mode: job.mode },
           ]
         })
         setSubmitting(false)
+        if (job.result_kind === 'json') {
+          setExpandedDiffs(prev => { const next = new Set(prev); next.add(job.id); return next })
+        }
         onPanelModeChange('side')
         scrollToBottom()
       }).catch(() => {
         setSubmitting(false)
         setPanelError('Failed to fetch job result.')
-        setTimeout(() => setPanelError(null), 4000)
       })
     } else {
       setTurns(prev => {
@@ -1789,7 +1798,96 @@ function AgentPanel({
                     {turn.error || 'Agent job failed.'}
                   </div>
                 )}
-                {isDone && (
+                {isDone && turn.result_kind === 'json' ? (
+                  (() => {
+                    const isStale = Date.now() - turn.timestamp > 10 * 60 * 1000
+                    const decided = !!turn.decision
+                    let ops: any[] = []
+                    try { ops = JSON.parse(turn.proposal_json ?? '[]') } catch {}
+                    const opCount = ops.length
+                    const diffExpanded = expandedDiffs.has(turn.jobId!)
+                    const toggleDiff = () => setExpandedDiffs(prev => {
+                      const next = new Set(prev)
+                      next.has(turn.jobId!) ? next.delete(turn.jobId!) : next.add(turn.jobId!)
+                      return next
+                    })
+                    if (opCount === 0) return (
+                      <div className="agent-proposal-empty">
+                        No changes suggested, the document looks good.
+                      </div>
+                    )
+                    return (
+                      <div className="agent-proposal-card">
+                        <div className="agent-proposal-header">
+                          <span className="agent-proposal-label">
+                            {turn.decision === 'applied' ? 'Applied changes' : 'Suggested changes'}
+                          </span>
+                          <button className="agent-proposal-toggle" onClick={toggleDiff}>
+                            {diffExpanded ? 'Hide' : 'Show'}
+                            <ChevronDown size={10} strokeWidth={2.5} className={`agent-proposal-toggle-chevron${diffExpanded ? ' agent-proposal-toggle-chevron--open' : ''}`} />
+                          </button>
+                        </div>
+                        {diffExpanded && ops.length > 0 && (
+                          <ul className="agent-proposal-diff-list">
+                            {ops.map((op: any, idx: number) => (
+                              <li key={idx} className="agent-proposal-diff-item">
+                                <div className="agent-proposal-diff-reason-row">
+                                  <span className="agent-proposal-diff-reason">{op.reason ?? (op.op === 'replace_text' ? 'Edit' : 'Insert')}</span>
+                                  {turn.decision === 'applied' && <span className="agent-proposal-state agent-proposal-state--applied">Applied</span>}
+                                  {isStale && !decided && <span className="agent-proposal-state agent-proposal-state--stale" title="This suggestion may no longer match the current document.">Stale</span>}
+                                </div>
+                                {op.op === 'replace_text' ? (
+                                  <div className="agent-proposal-diff-body">
+                                    <div className="agent-proposal-diff-row agent-proposal-diff-row--old">
+                                      <span className="agent-proposal-diff-gutter">−</span>
+                                      <span className="agent-proposal-diff-text">{op.oldText}</span>
+                                    </div>
+                                    <div className="agent-proposal-diff-row agent-proposal-diff-row--new">
+                                      <span className="agent-proposal-diff-gutter">+</span>
+                                      <span className="agent-proposal-diff-text">{op.newText}</span>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="agent-proposal-diff-body">
+                                    <div className="agent-proposal-diff-row agent-proposal-diff-row--new">
+                                      <span className="agent-proposal-diff-gutter">+</span>
+                                      <span className="agent-proposal-diff-text">{op.text}</span>
+                                    </div>
+                                  </div>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        {!decided && (
+                          <div className="agent-turn-actions">
+                            <button
+                              className="agent-turn-action-btn agent-turn-action-btn--primary"
+                              onClick={() => {
+                                try {
+                                  onApplyProposal(turn.jobId!, ops)
+                                  setTurns(prev => prev.map(t => t.jobId === turn.jobId ? { ...t, decision: 'applied' } : t))
+                                  patchJobDecision(turn.jobId!, 'applied')
+                                } catch {}
+                              }}
+                            >
+                              Apply changes
+                            </button>
+                            <button
+                              className="agent-turn-action-btn"
+                              onClick={() => {
+                                setTurns(prev => prev.map(t => t.jobId === turn.jobId ? { ...t, decision: 'dismissed' } : t))
+                                patchJobDecision(turn.jobId!, 'dismissed')
+                              }}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })()
+                ) : isDone && (
                   <>
                     <div
                       className="agent-result-prose"
@@ -1930,8 +2028,11 @@ function AgentPanel({
       </div>
 
       {panelError && (
-        <div className="ai-error-toast" onClick={() => setPanelError(null)}>
-          {panelError}
+        <div className="ai-error-toast">
+          <span className="ai-error-toast-msg">{panelError}</span>
+          <button className="ai-error-toast-close" onClick={() => setPanelError(null)} aria-label="Dismiss">
+            <X size={13} strokeWidth={2.5} />
+          </button>
         </div>
       )}
     </>
@@ -2003,6 +2104,8 @@ export default function Document() {
   const prefsLoadedRef = useRef(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const settingsRef = useRef<HTMLDivElement>(null)
+  const [agentStats, setAgentStats] = useState<any>(null)
+  const [agentStatsLoading, setAgentStatsLoading] = useState(false)
 
   const [shareOpen, setShareOpen] = useState(false)
   const [shareCopied, setShareCopied] = useState(false)
@@ -2118,6 +2221,8 @@ export default function Document() {
       }
     }
     document.addEventListener('mousedown', handler)
+    setAgentStatsLoading(true)
+    fetchAgentStats().then(setAgentStats).catch(() => {}).finally(() => setAgentStatsLoading(false))
     return () => document.removeEventListener('mousedown', handler)
   }, [settingsOpen])
 
@@ -2680,6 +2785,78 @@ export default function Document() {
     setAgentPanelMode('side')
   }
 
+  const handleApplyProposal = useCallback((jobId: string, proposal: any[]) => {
+    const ed = editorRef.current
+    if (!ed) return
+
+    const blockIndex: Record<string, { node: any; pos: number }> = {}
+    ed.state.doc.forEach((node, offset) => {
+      if (node.attrs.blockId) {
+        blockIndex[node.attrs.blockId] = { node, pos: offset }
+      }
+    })
+
+    for (const op of proposal) {
+      if (op.op === 'replace_text') {
+        if (!blockIndex[op.blockId] || !blockIndex[op.blockId].node.textContent.includes(op.oldText)) {
+          setAiError('Proposal is stale — document has changed since this job ran.')
+          return
+        }
+      } else if (op.op === 'insert_block_after') {
+        if (!blockIndex[op.afterBlockId]) {
+          setAiError('Proposal is stale — document has changed since this job ran.')
+          return
+        }
+      } else {
+        setAiError('Proposal contains unknown op type.')
+        return
+      }
+    }
+
+    const sortedOps = [...proposal].sort((a, b) => {
+      const posA = blockIndex[a.blockId ?? a.afterBlockId]?.pos ?? -1
+      const posB = blockIndex[b.blockId ?? b.afterBlockId]?.pos ?? -1
+      return posB - posA
+    })
+
+    const tr = ed.state.tr
+
+    for (const op of sortedOps) {
+      const blockId = op.blockId ?? op.afterBlockId
+      const block = blockIndex[blockId]
+      if (!block) continue
+
+      const { node, pos } = block
+
+      if (op.op === 'replace_text') {
+        const offset = node.textContent.indexOf(op.oldText)
+
+        if (offset === -1) continue
+
+        const from = pos + 1 + offset
+        const to = from + op.oldText.length
+
+        tr.replaceWith(from, to, ed.schema.text(op.newText))
+      }
+
+      if (op.op === 'insert_block_after') {
+        const insertPos = pos + node.nodeSize
+
+        const paragraph = ed.schema.nodes.paragraph.create(
+          null,
+          op.text ? ed.schema.text(op.text) : null
+        )
+
+        tr.insert(insertPos, paragraph)
+      }
+    }
+
+    if (tr.docChanged) {
+      ed.view.dispatch(tr)
+      setAiError(null)
+    }
+  }, [])
+
   return (
     <div className="app">
       {/* Main */}
@@ -2961,6 +3138,51 @@ export default function Document() {
                       </span>
                     </div>
                   )}
+                  <div className="settings-section settings-section--agent-stats">
+                    <div className="settings-row">
+                      <span className="settings-section-label" style={{ padding: 0 }}>Agent Stats</span>
+                      {agentStatsLoading && <LoaderCircle size={11} strokeWidth={2} className="settings-agent-stats-spinner" />}
+                    </div>
+                    {agentStatsLoading && !agentStats ? (
+                      <div className="settings-agent-stats-skeleton">
+                        {[80, 55, 70, 45].map(w => (
+                          <div key={w} className="settings-row">
+                            <span className="settings-skeleton-line" style={{ width: 72 }} />
+                            <span className="settings-skeleton-line" style={{ width: w }} />
+                          </div>
+                        ))}
+                      </div>
+                    ) : agentStats && (
+                      <>
+                        <div className="settings-row">
+                          <span className="settings-label">Total {agentStats.total_jobs === 1 ? 'job' : 'jobs'}</span>
+                          <span className="settings-agent-stat-value">{agentStats.total_jobs}</span>
+                        </div>
+                        <div className="settings-row">
+                          <span className="settings-label">Success rate</span>
+                          <span className="settings-agent-stat-value">{(agentStats.success_rate * 100).toFixed(0)}%</span>
+                        </div>
+                        <div className="settings-row">
+                          <span className="settings-label">Latency</span>
+                          <span className="settings-agent-stat-value">p50 {agentStats.p50_ms ?? '—'} | p95 {agentStats.p95_ms ?? '—'} ms</span>
+                        </div>
+                        <div className="settings-row">
+                          <span className="settings-label">Est. cost</span>
+                          <span className="settings-agent-stat-value">${agentStats.estimated_cost_usd.toFixed(4)}</span>
+                        </div>
+                        {Object.keys(agentStats.by_mode).length > 0 && (
+                          <div className="settings-agent-stats-modes">
+                            {Object.entries(agentStats.by_mode).map(([mode, s]: [string, any]) => (
+                              <div key={mode} className="settings-agent-stats-mode-row">
+                                <span className="settings-agent-stats-mode-name">{mode}</span>
+                                <span className="settings-agent-stats-mode-meta">{s.count} {s.count === 1 ? 'job' : 'jobs'} | p50 {s.p50_ms ?? '—'}ms | {s.avg_output_tokens} tok</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -3069,6 +3291,7 @@ export default function Document() {
           panelMode={agentPanelMode}
           onPanelModeChange={setAgentPanelMode}
           onUnseenChange={setAgentUnseenCount}
+          onApplyProposal={handleApplyProposal}
           incomingJob={incomingJob}
           onIncomingJobConsumed={() => setIncomingJob(null)}
           initialContext={agentInitialContext}
@@ -3097,8 +3320,11 @@ export default function Document() {
 
       {/* AI error toast */}
       {aiError && (
-        <div className="ai-error-toast" onClick={() => setAiError(null)}>
-          AI Error: {aiError}
+        <div className="ai-error-toast">
+          <span className="ai-error-toast-msg">AI Error: {aiError}</span>
+          <button className="ai-error-toast-close" onClick={() => setAiError(null)} aria-label="Dismiss">
+            <X size={13} strokeWidth={2.5} />
+          </button>
         </div>
       )}
 

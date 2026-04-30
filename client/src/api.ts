@@ -170,7 +170,7 @@ export type ServerEvent =
   | { type: 'doc:shared';   payload: Record<string, unknown> }
   | { type: 'doc:unshared'; payload: { room: string } }
   | { type: 'doc:deleted';  payload: { room: string } }
-  | { type: 'job:complete'; payload: { job_id: string; room: string; status: string; preview: string } }
+  | { type: 'job:complete'; payload: { job_id: string; room: string; status: string; result_kind?: string; preview?: string; op_count?: number } }
   | { type: 'job:failed';   payload: { job_id: string; room: string; error: string } }
 
 export function connectEvents(onEvent: (e: ServerEvent) => void): () => void {
@@ -207,12 +207,24 @@ export interface AgentJobResult {
   id: string
   current_state: string
   result: string | null
+  result_kind: string | null
+  proposal_json: string | null
+  decision: string | null
   error_msg: string | null
   mode: string
   task: string
   model_used: string
   output_tokens: number
   created_at: number
+}
+
+export async function patchJobDecision(jobId: string, decision: 'applied' | 'dismissed'): Promise<void> {
+  await fetch(`${BASE}/jobs/${jobId}/decision`, {
+    ...OPTS,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decision }),
+  })
 }
 
 export async function getJobResult(jobId: string): Promise<AgentJobResult> {
@@ -232,6 +244,12 @@ export async function getJobsForRoom(room: string): Promise<AgentJobResult[]> {
 }
 
 export const getDocumentJobs = getJobsForRoom
+
+export async function fetchAgentStats(): Promise<any> {
+  const res = await fetch(`${BASE}/admin/agent-stats`, OPTS)
+  if (!res.ok) throw new Error(`Failed to fetch agent stats: ${res.status}`)
+  return res.json()
+}
 
 // ── AI ───────────────────────────────────────────────────────────────
 
