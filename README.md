@@ -6,7 +6,7 @@ Real-time collaborative document editor with AI agents, CRDT sync, and a structu
 
 ## Screenshots
 
-[Image Placeholder: Main editor with agent panel open — hero shot with real document content, completed agent job, and `Apply changes` visible]
+![Hero Page](assets/Hero_Page.png)
 
 [Image Placeholder: Proposal apply flow — completed proposal showing op count and the `Apply changes` button, ideally with visible document changes after applying]
 
