@@ -30,7 +30,7 @@ CoWrite is split into three main pieces:
 
 Document state is stored as Yjs updates in SQLite rather than as plain text. That keeps the CRDT state intact and allows the server to reconstruct the latest collaborative state directly from the database.
 
-![System Overview](assets/System_Overview_Diagram_CoWrite.png)
+![System Overview](assets/System_Overview_Diagram.png)
 
 ### Agent Job Lifecycle
 
