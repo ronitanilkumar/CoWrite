@@ -42,7 +42,7 @@ Agent jobs are intentionally decoupled from the editor so users can keep writing
 4. The server pushes completion over SSE.
 5. The user reviews the result and explicitly applies it if it is still valid.
 
-![Agent Lifecycle](Agent_Job_Lifecycle_Diagram.png)
+![Agent Lifecycle](assets/Agent_Lifecycle_Diagram.png)
 
 ---
 
