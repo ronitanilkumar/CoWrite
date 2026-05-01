@@ -30,7 +30,7 @@ CoWrite is split into three main pieces:
 
 Document state is stored as Yjs updates in SQLite rather than as plain text. That keeps the CRDT state intact and allows the server to reconstruct the latest collaborative state directly from the database.
 
-[System_Overview_Diagram_CoWrite.png]
+![System Overview](System_Overview_Diagram_CoWrite.png)
 
 ### Agent Job Lifecycle
 
@@ -42,7 +42,7 @@ Agent jobs are intentionally decoupled from the editor so users can keep writing
 4. The server pushes completion over SSE.
 5. The user reviews the result and explicitly applies it if it is still valid.
 
-[Image Placeholder: Agent Proposal Flow]
+[Agent Lifecycle](Agent_Job_Lifecycle_Diagram.png)
 
 ---
 
