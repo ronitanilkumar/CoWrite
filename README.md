@@ -161,8 +161,5 @@ This is what allows a proposal op to say "replace text inside block X" instead o
 
 ## Future Work
 
-- Per-op accept/reject instead of applying an entire proposal at once
-- Stronger job execution primitives for multiple workers
-- Versioned document history and proposal replay
 - More precise token and cost accounting
 - Comments, annotations, and richer collaborative review workflows
