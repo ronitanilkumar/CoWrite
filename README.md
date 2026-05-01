@@ -6,14 +6,19 @@ Real-time collaborative document editor with AI agents, CRDT sync, and a structu
 
 ## Screenshots
 
+### Landing Page
 ![Hero Page](assets/Hero%20Page.png)
 
+### Agent Job Result
 ![Agent Jobs](assets/Agent%20Jobs.png)
 
+### Inline AI edit example
 ![Inline AI](assets/Inline_AI.png)
 
+### Collaboration State Between Two Users
 ![Collab State](assets/Collab%20State.png)
 
+### Agent Stats & Observability (Settings Popover)
 ![Agent Stats](assets/Agent_Stats.png)
 
 ---
