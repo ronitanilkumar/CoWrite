@@ -8,6 +8,8 @@ client/dist/
 
 # Database
 server/cowrite.db
+server/cowrite.db-shm
+server/cowrite.db-wal
 
 # Environment variables
 .env
