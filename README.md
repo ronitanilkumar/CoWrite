@@ -8,13 +8,13 @@ Real-time collaborative document editor with AI agents, CRDT sync, and a structu
 
 ![Hero Page](assets/Hero%20Page.png)
 
-[Image Placeholder: Proposal apply flow — completed proposal showing op count and the `Apply changes` button, ideally with visible document changes after applying]
+![Agent Jobs](assets/Agent%20Jobs.png)
 
-[Image Placeholder: Inline AI streaming — done-state result bar with `Undo`, `Keep & insert`, and `Chat more` visible below a selection]
+![Inline AI](assets/Collab%20State.png)
 
-[Image Placeholder: Multiplayer cursors — two browser windows side by side, different user colors, both editing the same document]
+![Collab State](assets/Collab%20State.png)
 
-[Image Placeholder: Agent stats in settings — settings popover showing real p50/p95 latency numbers and estimated cost]
+![Agent Stats](assets/Agent_Stats.png)
 
 ---
 
