@@ -12,7 +12,7 @@ Real-time collaborative document editor with AI agents, CRDT sync, and a structu
 ### Agent Job Result
 ![Agent Jobs](assets/Agent%20Jobs.png)
 
-### Inline AI edit example
+### Inline AI Edit Example
 ![Inline AI](assets/Inline_AI.png)
 
 ### Collaboration State Between Two Users
