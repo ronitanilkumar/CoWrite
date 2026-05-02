@@ -1,24 +1,60 @@
 # CoWrite
 
-Real-time collaborative document editor with AI agents, CRDT sync, and a structured proposal system for reviewing and applying AI edits.
+CoWrite is a real-time collaborative editor that integrates asynchronous AI into live documents while preserving consistency.
+
+AI systems operate on snapshots. Collaborative editors change continuously. This creates a correctness problem where generated edits can target content that no longer exists or has shifted.
+
+CoWrite addresses this with a structured execution and validation model:
+
+- Snapshot-based execution isolates AI from live edits
+- Structured proposal ops replace direct text mutation
+- Two-phase validation prevents stale or invalid changes
+- CRDT-based sync ensures convergence across clients
+
+The result is a system where AI suggestions remain consistent, reviewable, and safe under concurrent editing.
+
+---
+
+## Key Problems Solved
+
+### Async AI vs Live Editing
+
+AI runs on a frozen snapshot while users continue editing. Generated results are applied only if the document still satisfies the original assumptions.
+
+### Stale Edit Prevention
+
+Edits reference specific blocks and expected content. Validation ensures that changes are only applied when the document state matches those expectations.
+
+### Multi-User Consistency
+
+Yjs CRDT replication allows concurrent edits across clients without centralized transforms. The system converges automatically.
+
+### Safe AI Integration
+
+AI produces structured operations instead of raw text. This allows deterministic validation and controlled application.
 
 ---
 
 ## Screenshots
 
 ### Landing Page
+
 ![Hero Page](assets/Hero%20Page.png)
 
 ### Agent Job Result
+
 ![Agent Jobs](assets/Agent%20Jobs.png)
 
 ### Inline AI Edit Example
+
 ![Inline AI](assets/Inline_AI.png)
 
 ### Collaboration State Between Two Users
+
 ![Collab State](assets/Collab%20State.png)
 
-### Agent Stats & Observability (Settings Popover)
+### Agent Stats and Observability
+
 ![Agent Stats](assets/Agent_Stats.png)
 
 ---
@@ -27,25 +63,28 @@ Real-time collaborative document editor with AI agents, CRDT sync, and a structu
 
 ### System Overview
 
-CoWrite is split into three main pieces:
+CoWrite consists of three components:
 
-- A React + TipTap client for rich-text editing, inline AI interactions, and proposal review.
-- A Node.js server that handles authentication, document access control, REST APIs, SSE events, and Yjs WebSocket sync.
-- A background worker that processes agent jobs asynchronously, stores results, and notifies the client when work is complete.
+- React and TipTap client for editing, inline AI, and proposal review
+- Node.js server for auth, access control, APIs, SSE, and Yjs sync
+- Background worker for asynchronous agent execution
 
-Document state is stored as Yjs updates in SQLite rather than as plain text. That keeps the CRDT state intact and allows the server to reconstruct the latest collaborative state directly from the database.
+Document state is stored as Yjs updates in SQLite. This preserves the full CRDT state and allows reconstruction of the latest document without converting to plain text.
 
 ![System Overview](assets/System_Overview_Diagram.png)
 
+---
+
 ### Agent Job Lifecycle
 
-Agent jobs are intentionally decoupled from the editor so users can keep writing while AI work happens in the background:
+Agent execution is decoupled from the editor:
 
-1. A user submits an agent task from the editor.
-2. The server captures a frozen snapshot of the document and inserts a pending job into SQLite.
-3. The worker claims the job atomically, calls Claude, and stores either structured proposal ops or text results.
-4. The server pushes completion over SSE.
-5. The user reviews the result and explicitly applies it if it is still valid.
+1. User submits an agent task
+2. Server captures a snapshot and stores a pending job
+3. Worker claims the job atomically and executes it
+4. Result is stored as structured ops or text
+5. Server notifies the client over SSE
+6. User reviews and applies if valid
 
 ![Agent Lifecycle](assets/Agent_Lifecycle_Diagram.png)
 
@@ -53,95 +92,119 @@ Agent jobs are intentionally decoupled from the editor so users can keep writing
 
 ## Key Technical Decisions
 
-### CRDTs over Operational Transformation
+### CRDT-Based Collaboration
 
-CoWrite uses Yjs, which implements a CRDT (Conflict-free Replicated Data Type) for document sync. Each client keeps a replica of the document, and concurrent edits merge through the data structure itself rather than through a centralized transform pipeline.
+CoWrite uses Yjs for document synchronization. Each client maintains a local replica. Concurrent edits merge through the CRDT structure.
 
-The practical tradeoff is that the server does not need to serialize or transform every edit. It mainly acts as a relay and persistence layer, while Yjs handles merging. This also makes the collaboration model more tolerant of temporary disconnects and reconnections.
+The server acts as relay and persistence. It does not transform edits. Yjs ensures convergence across clients.
 
-Yjs awareness state, such as cursor presence and AI typing indicators, is ephemeral. It is shared live between connected clients but is not persisted to SQLite.
+Awareness state such as cursors is ephemeral and not persisted.
 
-### SQLite WAL Mode
+---
 
-SQLite runs in WAL (write-ahead log) mode. This matters because the app has multiple concurrent readers and writers:
+### Frozen Snapshot Execution
 
-- the document server reads and saves collaborative state
-- the worker reads documents and updates agent jobs
-- REST routes read and update sharing, preferences, and job metadata
+Each agent job stores a snapshot of the document at submit time.
 
-WAL mode allows those reads and writes to overlap more cleanly than default journal mode.
+This ensures that the worker generates edits against a stable view of the document. Without this, results could target content that has already changed.
 
-Documents are stored as binary Yjs state blobs rather than normalized text rows. The point is to preserve the full collaborative document state directly, instead of trying to map rich collaborative editing into a relational schema.
+---
 
-### Atomic Job Claiming
+### Structured Proposals and Two-Phase Validation
 
-The worker claims jobs with a single SQL `UPDATE ... RETURNING *` statement. That avoids the usual race where two workers both read the same pending job before either has updated it.
-
-The claim logic also handles two failure cases in the same query:
-
-- retrying failed jobs while attempts remain
-- reclaiming jobs that were marked `running` but timed out
-
-That keeps the queue implementation simple while still being safe under concurrency.
-
-### Frozen Snapshot at Submit Time
-
-When a user submits an agent job, the server immediately captures a snapshot of the document's block structure and stores it on the job row.
-
-This solves a real async correctness problem: the worker may run seconds later, but the document is still changing. Without the snapshot, the model could generate edits against content that no longer exists in the same form by the time the result is ready.
-
-With the snapshot in place, the worker always generates proposals against the document as it existed at submit time, not whatever the document happens to look like later.
-
-### Structured Proposals with Two-Phase Validation
-
-For edit-producing modes, agent output is stored as structured JSON ops such as:
+Agent output is stored as structured operations:
 
 - `replace_text`
 - `insert_block_after`
 
-The model does not directly mutate the document. Instead, the user reviews a proposal in the agent panel and decides whether to apply it.
+The system never applies raw model output directly.
 
-CoWrite validates proposals in two phases:
+Validation occurs in two stages:
 
-- Server-side validation checks that each target block exists in the frozen snapshot and that the referenced `oldText` matches the snapshot content.
-- Client-side preflight checks the same assumptions against the live document right before apply.
+- Server validation checks block existence and content against the snapshot
+- Client validation checks the same assumptions against the live document
 
-If the document has drifted, the proposal is marked stale and apply is aborted. If validation passes, the client applies the full proposal through a single ProseMirror transaction.
+If the document has changed, the proposal is rejected. If validation passes, the client applies all operations in a single transaction.
 
-Ops are applied back-to-front so earlier replacements do not shift the positions of later ones.
+Operations are applied in reverse order to preserve positions.
 
-### Map-Reduce for Long Documents
+---
 
-For larger documents, the worker switches from a single model call to a chunked map-reduce pipeline.
+### Atomic Job Claiming
 
-In the map phase, the worker splits the document into overlapping chunks and sends them to Claude in parallel. In the reduce phase, results are merged differently depending on mode:
+Workers claim jobs using a single SQL `UPDATE ... RETURNING *` statement.
 
-- proposal modes merge edit op arrays
-- summarize runs a second model call to combine partial summaries
-- review deduplicates overlapping findings
+This prevents multiple workers from claiming the same job.
 
-This keeps long-document behavior responsive without requiring a separate orchestration system.
+The same query handles retries and reclaims timed-out jobs.
 
-### Stable Block IDs for Edit Targeting
+---
 
-Block-level nodes are stamped with stable UUIDs by a ProseMirror plugin. Those IDs survive serialization and collaborative sync, which makes them a better target for AI proposals than absolute character positions.
+### SQLite WAL Mode
 
-This is what allows a proposal op to say "replace text inside block X" instead of "replace text at character offset Y," which would be much more fragile in a live collaborative editor.
+SQLite runs in WAL mode to support concurrent reads and writes across:
+
+- document persistence
+- worker execution
+- API routes
+
+Document data is stored as binary Yjs state rather than normalized rows to preserve full collaborative state.
+
+---
+
+### Map-Reduce Execution for Long Documents
+
+Large documents are processed using a chunked pipeline:
+
+- Map phase sends overlapping chunks to the model in parallel
+- Reduce phase merges results based on task type
+
+This maintains responsiveness without external orchestration.
+
+---
+
+### Stable Block Identifiers
+
+Each block is assigned a stable UUID.
+
+This allows operations to target blocks directly instead of relying on character offsets, which are unstable under concurrent edits.
 
 ---
 
 ## Features
 
 - Real-time multiplayer editing with TipTap, ProseMirror, Yjs, and `y-websocket`
-- Live cursors with presence, idle detection, and click-to-follow
-- Background AI agents that run asynchronously and notify the client over SSE
-- Structured proposal review with diff-style previews and explicit apply
-- Inline AI for writing, rewriting, continuing, and summarizing selected content
-- Undo / keep / chat-more controls for inline AI output
-- Map-reduce handling for long documents
-- Document sharing with per-user access control
-- Per-document editor preferences persisted to the server
-- Agent metrics including success rate, p50/p95 latency, per-mode stats, and estimated cost
+- Live cursors with presence and follow mode
+- Background AI agents with asynchronous execution over SSE
+- Structured proposal system with diff preview and explicit apply
+- Inline AI for writing, rewriting, and summarization
+- Undo, keep, and follow-up controls for inline output
+- Map-reduce processing for large documents
+- Document sharing with access control
+- Persistent editor preferences per document
+- Agent metrics including latency, success rate, and cost estimates
+
+---
+
+## Performance and Observability
+
+CoWrite includes an agent observability panel that tracks:
+
+- Job success rate
+- p50 and p95 latency
+- Per-mode execution statistics
+- Estimated AI cost
+- Recent job outcomes
+
+Example benchmark format:
+
+| Metric | Result |
+| --- | --- |
+| Agent success rate | TODO |
+| p50 latency | TODO |
+| p95 latency | TODO |
+| Job throughput | TODO jobs/min |
+| Concurrent collaborators tested | TODO |
 
 ---
 
@@ -161,5 +224,6 @@ This is what allows a proposal op to say "replace text inside block X" instead o
 
 ## Future Work
 
-- More precise token and cost accounting
-- Comments, annotations, and richer collaborative review workflows
+- Precise token and cost tracking
+- Comments and annotation workflows
+- Expanded collaborative review features
