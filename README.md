@@ -196,16 +196,6 @@ CoWrite includes an agent observability panel that tracks:
 - Estimated AI cost
 - Recent job outcomes
 
-Example benchmark format:
-
-| Metric | Result |
-| --- | --- |
-| Agent success rate | TODO |
-| p50 latency | TODO |
-| p95 latency | TODO |
-| Job throughput | TODO jobs/min |
-| Concurrent collaborators tested | TODO |
-
 ---
 
 ## Stack
